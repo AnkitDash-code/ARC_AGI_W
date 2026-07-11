@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
 from typing import Any
 
 from mythos.arc import ArcTask
-from mythos.solvers.base import SolverError
+from mythos.features import hrm_sequence_to_grid, output_shape_hint
+from mythos.hrm_dataset import build_hrm_dataset, default_run_dir, prepare_hrm_raw_dataset
+from mythos.solvers.base import SolverError, make_prediction
 from mythos.submission import Prediction
 
 
@@ -94,7 +97,7 @@ class HRMEnvironment:
 
 
 class HRMSolver:
-    """Placeholder real-model solver that fails early unless HRM is configured."""
+    """External HRM solver for CUDA/Kaggle smoke inference."""
 
     def __init__(self, env: HRMEnvironment | None = None) -> None:
         self.env = env
@@ -102,7 +105,162 @@ class HRMSolver:
     def solve(self, task: ArcTask) -> Prediction:
         env = self.env or HRMEnvironment.from_env()
         env.validate(require_cuda=True)
-        raise HRMEnvironmentError(
-            f"{task.id}: HRM environment is valid, but direct prediction wiring is not implemented yet. "
-            "Use `python -m mythos.hrm_smoke` to validate the external runtime and dataset path."
+        runner = HRMInferenceRunner(env)
+        return runner.solve_task(task)
+
+
+@dataclass(frozen=True)
+class HRMInferenceRunner:
+    env: HRMEnvironment
+    num_aug: int = 0
+
+    def solve_task(self, task: ArcTask) -> Prediction:
+        run_dir = default_run_dir() / "hrm_inference" / task.id
+        raw_dir = prepare_hrm_raw_dataset(
+            (task,),
+            run_dir / "raw" / "ARC-AGI-2" / "data",
+            allow_dummy_test_outputs=True,
         )
+        dataset_dir = run_dir / "data" / "arc-2-one-task"
+        build_hrm_dataset(
+            hrm_repo_dir=self.env.repo_dir,
+            raw_data_dir=raw_dir,
+            output_dir=dataset_dir,
+            num_aug=self.num_aug,
+        )
+        prediction_tokens = self._run_external_evaluate(dataset_dir, run_dir / "outputs")
+        return self._tokens_to_prediction(task, prediction_tokens)
+
+    def solve_tasks(self, tasks: list[ArcTask] | tuple[ArcTask, ...]) -> list[Prediction]:
+        task_list = list(tasks)
+        if not task_list:
+            return []
+        run_dir = default_run_dir() / "hrm_inference_batch"
+        raw_dir = prepare_hrm_raw_dataset(
+            task_list,
+            run_dir / "raw" / "ARC-AGI-2" / "data",
+            allow_dummy_test_outputs=True,
+        )
+        dataset_dir = run_dir / "data" / "arc-2-batch"
+        build_hrm_dataset(
+            hrm_repo_dir=self.env.repo_dir,
+            raw_data_dir=raw_dir,
+            output_dir=dataset_dir,
+            num_aug=self.num_aug,
+        )
+        prediction_tokens = self._run_external_evaluate(dataset_dir, run_dir / "outputs")
+        predictions: list[Prediction] = []
+        cursor = 0
+        for task in task_list:
+            count = len(task.test)
+            predictions.append(self._tokens_to_prediction(task, prediction_tokens[cursor : cursor + count]))
+            cursor += count
+        if cursor > len(prediction_tokens):
+            raise HRMEnvironmentError(
+                f"HRM returned {len(prediction_tokens)} predictions for {cursor} requested test inputs"
+            )
+        return predictions
+
+    def _tokens_to_prediction(
+        self,
+        task: ArcTask,
+        prediction_tokens: list[tuple[list[int], list[int]]],
+    ) -> Prediction:
+        if len(prediction_tokens) < len(task.test):
+            raise HRMEnvironmentError(
+                f"{task.id}: HRM returned {len(prediction_tokens)} predictions for "
+                f"{len(task.test)} test inputs"
+            )
+
+        attempts = []
+        for index, example in enumerate(task.test):
+            shape_hint = output_shape_hint(task, example.input)
+            top1, top2 = prediction_tokens[index]
+            attempts.append(
+                (
+                    hrm_sequence_to_grid(top1, shape_hint=shape_hint),
+                    hrm_sequence_to_grid(top2, shape_hint=shape_hint),
+                )
+            )
+        return make_prediction(task, attempts)
+
+    def _run_external_evaluate(self, dataset_dir: Path, output_dir: Path) -> list[tuple[list[int], list[int]]]:
+        torch = HRMEnvironment._import_torch()
+        modules = self.env.import_modules()
+        pretrain = modules["pretrain"]
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config = self._load_eval_config(dataset_dir=dataset_dir, output_dir=output_dir)
+        train_loader, train_metadata = pretrain.create_dataloader(
+            config,
+            "train",
+            test_set_mode=False,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=0,
+            world_size=1,
+        )
+        eval_loader, eval_metadata = pretrain.create_dataloader(
+            config,
+            "test",
+            test_set_mode=True,
+            epochs_per_iter=1,
+            global_batch_size=config.global_batch_size,
+            rank=0,
+            world_size=1,
+        )
+        del train_loader
+
+        train_state = pretrain.init_train_state(config, train_metadata, world_size=1)
+        checkpoint = torch.load(self.env.checkpoint_path, map_location="cuda", weights_only=False)
+        try:
+            train_state.model.load_state_dict(checkpoint, assign=True)
+        except Exception:
+            train_state.model.load_state_dict(
+                {key.removeprefix("_orig_mod."): value for key, value in checkpoint.items()},
+                assign=True,
+            )
+        train_state.step = 0
+        train_state.model.eval()
+        pretrain.evaluate(config, train_state, eval_loader, eval_metadata, rank=0, world_size=1)
+        return _load_decoded_hrm_predictions(output_dir)
+
+    def _load_eval_config(self, *, dataset_dir: Path, output_dir: Path):  # type: ignore[no-untyped-def]
+        try:
+            import yaml
+            from pretrain import PretrainConfig
+        except Exception as exc:  # pragma: no cover - depends on external HRM deps.
+            raise HRMEnvironmentError(f"failed to import HRM config dependencies: {exc}") from exc
+
+        config_path = self.env.checkpoint_path.parent / "all_config.yaml"
+        if not config_path.exists():
+            raise HRMEnvironmentError(f"HRM checkpoint directory is missing all_config.yaml: {config_path}")
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = PretrainConfig(**yaml.safe_load(handle))
+        config.data_path = str(dataset_dir)
+        config.checkpoint_path = str(output_dir)
+        config.eval_save_outputs = ["inputs", "puzzle_identifiers", "logits"]
+        if "HRM_GLOBAL_BATCH_SIZE" in os.environ:
+            config.global_batch_size = int(os.environ["HRM_GLOBAL_BATCH_SIZE"])
+        return config
+
+
+def _load_decoded_hrm_predictions(output_dir: Path) -> list[tuple[list[int], list[int]]]:
+    torch = HRMEnvironment._import_torch()
+    pred_files = sorted(output_dir.glob("step_*_all_preds.*"))
+    if not pred_files:
+        raise HRMEnvironmentError(f"HRM evaluation wrote no prediction files in {output_dir}")
+
+    raw = torch.load(pred_files[0], map_location="cpu", weights_only=False)
+    if "logits" not in raw:
+        raise HRMEnvironmentError(
+            f"HRM prediction file {pred_files[0]} is missing logits; keys={sorted(raw)}"
+        )
+    logits = raw["logits"]
+    topk = logits.topk(k=2, dim=-1).indices
+    decoded: list[tuple[list[int], list[int]]] = []
+    for row in range(topk.shape[0]):
+        top1 = topk[row, :, 0].to(dtype=torch.int64).tolist()
+        top2 = topk[row, :, 1].to(dtype=torch.int64).tolist()
+        decoded.append((top1, top2))
+    return decoded

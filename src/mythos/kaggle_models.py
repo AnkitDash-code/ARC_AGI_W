@@ -14,12 +14,12 @@ import urllib.request
 from typing import Iterable
 
 
-CHECKPOINT_SUFFIXES = (".pt", ".pth", ".ckpt", ".bin")
+CHECKPOINT_SUFFIXES = (".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".tar")
 
 
 MODEL_ENV_KEYS = (
-    "IJEPA_REPO_DIR",
     "IJEPA_CHECKPOINT_PATH",
+    "IJEPA_PROJECTION_CHECKPOINT_PATH",
     "HRM_TEXT_REPO_DIR",
     "HRM_TEXT_CHECKPOINT_PATH",
     "WORLD_MODEL_CHECKPOINT_PATH",
@@ -34,6 +34,12 @@ HF_MODEL_SPECS = (
         "repo_id_env": "IJEPA_HF_REPO_ID",
         "repo_dir_env": None,
         "checkpoint_env": "IJEPA_CHECKPOINT_PATH",
+    },
+    {
+        "name": "jepa_projection",
+        "repo_id_env": "IJEPA_PROJECTION_HF_REPO_ID",
+        "repo_dir_env": None,
+        "checkpoint_env": "IJEPA_PROJECTION_CHECKPOINT_PATH",
     },
     {
         "name": "hrm_text",
@@ -63,11 +69,6 @@ HF_MODEL_SPECS = (
 
 GIT_REPO_SPECS = (
     {
-        "name": "jepa",
-        "url_env": "IJEPA_GIT_REPO_URL",
-        "repo_dir_env": "IJEPA_REPO_DIR",
-    },
-    {
         "name": "hrm_text",
         "url_env": "HRM_TEXT_GIT_REPO_URL",
         "repo_dir_env": "HRM_TEXT_REPO_DIR",
@@ -84,6 +85,11 @@ DIRECT_CHECKPOINT_SPECS = (
         "name": "jepa",
         "url_env": "IJEPA_CHECKPOINT_URL",
         "checkpoint_env": "IJEPA_CHECKPOINT_PATH",
+    },
+    {
+        "name": "jepa_projection",
+        "url_env": "IJEPA_PROJECTION_CHECKPOINT_URL",
+        "checkpoint_env": "IJEPA_PROJECTION_CHECKPOINT_PATH",
     },
     {
         "name": "hrm_text",
@@ -298,11 +304,13 @@ def autodiscover_model_inputs(
         discovered["HRM_REPO_DIR"] = hrm_repo
         discovered["HRM_CHECKPOINT_PATH"] = hrm_checkpoint
 
-    ijepa_repo = _find_named_repo(root, names=("ijepa", "i-jepa", "jepa"))
-    ijepa_checkpoint = _find_checkpoint(root, include=("ijepa", "i-jepa", "jepa"))
-    if ijepa_repo is not None and ijepa_checkpoint is not None:
-        discovered["IJEPA_REPO_DIR"] = ijepa_repo
+    ijepa_checkpoint = _find_checkpoint(root, include=("ijepa", "i-jepa", "jepa"), exclude=("projection",))
+    if ijepa_checkpoint is not None:
         discovered["IJEPA_CHECKPOINT_PATH"] = ijepa_checkpoint
+
+    ijepa_projection_checkpoint = _find_checkpoint(root, include=("ijepa", "projection"), require_all=True)
+    if ijepa_projection_checkpoint is not None:
+        discovered["IJEPA_PROJECTION_CHECKPOINT_PATH"] = ijepa_projection_checkpoint
 
     hrm_text_repo = _find_named_repo(root, names=("hrm-text", "hrm_text", "hrmtext"))
     hrm_text_checkpoint = _find_checkpoint(root, include=("hrm", "text"), require_all=True)

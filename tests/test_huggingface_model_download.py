@@ -10,6 +10,7 @@ from mythos.kaggle_models import (
 def test_huggingface_download_skips_when_no_repo_ids(monkeypatch) -> None:
     for key in (
         "IJEPA_HF_REPO_ID",
+        "IJEPA_PROJECTION_HF_REPO_ID",
         "HRM_TEXT_HF_REPO_ID",
         "WORLD_MODEL_HF_REPO_ID",
         "TTT_LORA_HF_REPO_ID",
@@ -36,6 +37,7 @@ def test_git_code_download_skips_when_no_urls(monkeypatch) -> None:
 def test_direct_checkpoint_download_skips_when_no_urls(monkeypatch) -> None:
     for key in (
         "IJEPA_CHECKPOINT_URL",
+        "IJEPA_PROJECTION_CHECKPOINT_URL",
         "HRM_TEXT_CHECKPOINT_URL",
         "WORLD_MODEL_CHECKPOINT_URL",
         "TTT_LORA_CHECKPOINT_URL",

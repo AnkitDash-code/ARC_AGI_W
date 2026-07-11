@@ -9,6 +9,7 @@ import sys
 
 from mythos.arc import ArcValidationError, load_challenges
 from mythos.metrics import score_files
+from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner
 from mythos.solvers.base import SolverError
 from mythos.solvers.factory import make_solver
 from mythos.submission import write_submission
@@ -69,7 +70,12 @@ def main(argv: list[str] | None = None) -> int:
 
         tasks = load_challenges(challenge_path)
         solver = make_solver(args.solver, model_mode=args.model_mode)
-        predictions = [solver.solve(task) for task in tasks.values()]
+        if args.solver == "hrm":
+            env = HRMEnvironment.from_env()
+            env.validate(require_cuda=True)
+            predictions = HRMInferenceRunner(env).solve_tasks(list(tasks.values()))
+        else:
+            predictions = [solver.solve(task) for task in tasks.values()]
         write_submission(predictions, args.out)
 
         summary: dict[str, object] = {

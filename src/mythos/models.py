@@ -29,13 +29,16 @@ MODEL_SPECS: tuple[ModelSpec, ...] = (
     ModelSpec(
         key="jepa",
         label="JEPA encoder",
-        repo_env="IJEPA_REPO_DIR",
         checkpoint_env="IJEPA_CHECKPOINT_PATH",
+    ),
+    ModelSpec(
+        key="jepa_projection",
+        label="I-JEPA projection",
+        checkpoint_env="IJEPA_PROJECTION_CHECKPOINT_PATH",
     ),
     ModelSpec(
         key="hrm_text",
         label="HRM-Text H-module",
-        repo_env="HRM_TEXT_REPO_DIR",
         checkpoint_env="HRM_TEXT_CHECKPOINT_PATH",
     ),
     ModelSpec(
@@ -179,6 +182,13 @@ def _import_modules(spec: ModelSpec) -> dict[str, Any]:
 
 
 def _load_torch_checkpoint(checkpoint_path: Path) -> Any:
+    if checkpoint_path.is_dir() or checkpoint_path.suffix.lower() == ".safetensors":
+        return {
+            "path": str(checkpoint_path),
+            "format": checkpoint_path.suffix.lower().lstrip(".") or "directory",
+            "lazy": True,
+        }
+
     try:
         torch = importlib.import_module("torch")
     except Exception as exc:

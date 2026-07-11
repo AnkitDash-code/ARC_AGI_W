@@ -8,7 +8,7 @@ import subprocess
 import sys
 from typing import Iterable
 
-from mythos.arc import ArcTask, ArcValidationError, require_test_outputs
+from mythos.arc import ArcTask, ArcValidationError, Grid, require_test_outputs
 
 
 def default_run_dir() -> Path:
@@ -17,11 +17,17 @@ def default_run_dir() -> Path:
     return Path(os.environ.get("MYTHOS_RUN_DIR", "runs"))
 
 
-def prepare_hrm_raw_dataset(tasks: Iterable[ArcTask], output_dir: str | Path) -> Path:
+def prepare_hrm_raw_dataset(
+    tasks: Iterable[ArcTask],
+    output_dir: str | Path,
+    *,
+    allow_dummy_test_outputs: bool = False,
+) -> Path:
     """Write tasks into the directory shape HRM's ARC dataset builder expects."""
 
     task_list = list(tasks)
-    require_test_outputs(task_list)
+    if not allow_dummy_test_outputs:
+        require_test_outputs(task_list)
 
     raw_data_dir = Path(output_dir)
     eval_dir = raw_data_dir / "evaluation"
@@ -34,7 +40,12 @@ def prepare_hrm_raw_dataset(tasks: Iterable[ArcTask], output_dir: str | Path) ->
                 for example in task.train
             ],
             "test": [
-                {"input": example.input, "output": example.output}
+                {
+                    "input": example.input,
+                    "output": example.output
+                    if example.output is not None
+                    else _dummy_output_like(example.input),
+                }
                 for example in task.test
             ],
         }
@@ -42,6 +53,10 @@ def prepare_hrm_raw_dataset(tasks: Iterable[ArcTask], output_dir: str | Path) ->
             json.dump(raw_task, handle, indent=2)
             handle.write("\n")
     return raw_data_dir
+
+
+def _dummy_output_like(grid: Grid) -> Grid:
+    return [[0 for _ in row] for row in grid]
 
 
 def build_hrm_dataset(

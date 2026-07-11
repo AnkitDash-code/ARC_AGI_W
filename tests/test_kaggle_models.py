@@ -38,12 +38,27 @@ def test_autodiscover_sets_checkpoint_only_models(tmp_path: Path, monkeypatch: p
     _clear_env(monkeypatch)
     world = tmp_path / "world-model" / "world_model.pt"
     lora = tmp_path / "lora-adapter" / "adapter_lora.pt"
+    projection = tmp_path / "ijepa-projection" / "ijepa_projection.pt"
     world.parent.mkdir()
     lora.parent.mkdir()
+    projection.parent.mkdir()
     world.write_bytes(b"fake")
     lora.write_bytes(b"fake")
+    projection.write_bytes(b"fake")
 
     result = autodiscover_model_inputs(tmp_path, apply=False)
 
+    assert result["set"]["IJEPA_PROJECTION_CHECKPOINT_PATH"] == str(projection)
     assert result["set"]["WORLD_MODEL_CHECKPOINT_PATH"] == str(world)
     assert result["set"]["TTT_LORA_CHECKPOINT_PATH"] == str(lora)
+
+
+def test_autodiscover_sets_ijepa_checkpoint_without_code_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    checkpoint = tmp_path / "facebook-ijepa-vith14" / "model.safetensors"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"fake")
+
+    result = autodiscover_model_inputs(tmp_path, apply=False)
+
+    assert result["set"]["IJEPA_CHECKPOINT_PATH"] == str(checkpoint)

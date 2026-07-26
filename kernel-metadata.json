@@ -1,0 +1,15 @@
+{
+  "id": "ankitdash24/project-mythos-pipeline",
+  "title": "Project Mythos Pipeline",
+  "code_file": "project_mythos_kaggle_pipeline_standalone.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["ankitdash24/hrm-arc2-checkpoint"],
+  "competition_sources": ["arc-prize-2026-arc-agi-2"],
+  "kernel_sources": []
+}

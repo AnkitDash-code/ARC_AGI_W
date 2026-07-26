@@ -6,13 +6,15 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import traceback
 
-from mythos.arc import ArcValidationError, load_challenges
+from mythos.arc import ArcTask, ArcValidationError, copy_grid, load_challenges
 from mythos.metrics import score_files
-from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner
-from mythos.solvers.base import SolverError
+from mythos.solvers.base import SolverError, make_prediction
+from mythos.solvers.baseline import BaselineSolver
 from mythos.solvers.factory import make_solver
-from mythos.submission import write_submission
+from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner
+from mythos.submission import Prediction, write_submission
 
 DEFAULT_KAGGLE_DATA_DIR = Path("/kaggle/input/competitions/arc-prize-2026-arc-agi-2")
 DEFAULT_KAGGLE_OUTPUT = Path("/kaggle/working/submission.json")
@@ -52,6 +54,26 @@ def _first_existing(data_dir: Path, names: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"none of these files exist in {data_dir}: {joined}")
 
 
+def solve_with_fallback(solver, fallback_solver, task: ArcTask) -> Prediction:
+    """Solve one task, degrading to guaranteed-output fallbacks on any failure.
+
+    A Kaggle rerun must always write a submission.json even if some tasks
+    crash their primary solver (model errors, OOM, malformed grids, etc.);
+    letting one bad task abort the whole loop would zero out every other
+    already-solved task too.
+    """
+    try:
+        return solver.solve(task)
+    except Exception as exc:  # noqa: BLE001 - any solver failure must not abort the run
+        print(f"WARNING: {task.id} failed with {solver.__class__.__name__}: {exc!r}; using baseline fallback", file=sys.stderr)
+    try:
+        return fallback_solver.solve(task)
+    except Exception as exc:  # noqa: BLE001 - last-resort guarantee of a valid prediction
+        print(f"WARNING: {task.id} baseline fallback also failed: {exc!r}; using trivial prediction", file=sys.stderr)
+    attempts = [(copy_grid(example.input), [[0]]) for example in task.test]
+    return make_prediction(task, attempts)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Mythos against Kaggle ARC-AGI data.")
     parser.add_argument("--data-dir", default=str(DEFAULT_KAGGLE_DATA_DIR))
@@ -70,12 +92,24 @@ def main(argv: list[str] | None = None) -> int:
 
         tasks = load_challenges(challenge_path)
         solver = make_solver(args.solver, model_mode=args.model_mode)
+        fallback_solver = solver if isinstance(solver, BaselineSolver) else BaselineSolver()
         if args.solver == "hrm":
-            env = HRMEnvironment.from_env()
-            env.validate(require_cuda=True)
-            predictions = HRMInferenceRunner(env).solve_tasks(list(tasks.values()))
+            try:
+                env = HRMEnvironment.from_env()
+                env.validate(require_cuda=True)
+                predictions = HRMInferenceRunner(env).solve_tasks(list(tasks.values()))
+            except Exception as exc:  # noqa: BLE001 - HRM batch failure must not abort the run
+                print(f"WARNING: HRM batch run failed: {exc!r}; using baseline fallback for all tasks", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                if getattr(exc, "stdout", None):
+                    print("--- subprocess stdout (tail) ---", file=sys.stderr)
+                    print(exc.stdout[-4000:], file=sys.stderr)
+                if getattr(exc, "stderr", None):
+                    print("--- subprocess stderr (tail) ---", file=sys.stderr)
+                    print(exc.stderr[-4000:], file=sys.stderr)
+                predictions = [fallback_solver.solve(task) for task in tasks.values()]
         else:
-            predictions = [solver.solve(task) for task in tasks.values()]
+            predictions = [solve_with_fallback(solver, fallback_solver, task) for task in tasks.values()]
         write_submission(predictions, args.out)
 
         summary: dict[str, object] = {

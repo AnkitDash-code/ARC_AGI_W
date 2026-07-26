@@ -213,13 +213,7 @@ class HRMInferenceRunner:
 
         train_state = pretrain.init_train_state(config, train_metadata, world_size=1)
         checkpoint = torch.load(self.env.checkpoint_path, map_location="cuda", weights_only=False)
-        try:
-            train_state.model.load_state_dict(checkpoint, assign=True)
-        except Exception:
-            train_state.model.load_state_dict(
-                {key.removeprefix("_orig_mod."): value for key, value in checkpoint.items()},
-                assign=True,
-            )
+        _load_hrm_checkpoint_best_effort(train_state.model, checkpoint)
         train_state.step = 0
         train_state.model.eval()
         pretrain.evaluate(config, train_state, eval_loader, eval_metadata, rank=0, world_size=1)
@@ -243,6 +237,45 @@ class HRMInferenceRunner:
         if "HRM_GLOBAL_BATCH_SIZE" in os.environ:
             config.global_batch_size = int(os.environ["HRM_GLOBAL_BATCH_SIZE"])
         return config
+
+
+def _load_hrm_checkpoint_best_effort(model: Any, checkpoint: dict[str, Any]) -> None:
+    """Load the pretrained checkpoint, keeping randomly-initialized weights for any
+    key whose shape doesn't match.
+
+    HRM's `puzzle_emb` is a per-puzzle lookup table sized to the exact puzzle
+    identifier vocabulary of whatever dataset it was trained on (the public
+    checkpoint: 1,045,829 entries). A dataset built from a different task set
+    (ours: 240 tasks) gets fresh, unrelated identifier indices, so this table
+    can never meaningfully transfer -- there is no "fix" for that mismatch,
+    only whether to keep evaluating with it randomly initialized (this) or
+    fail outright. Every other weight (attention/MLP layers, token/H/L init,
+    LM head) is the real pretrained model and does transfer correctly.
+    """
+    model_state = model.state_dict()
+    filtered: dict[str, Any] = {}
+    skipped: list[str] = []
+    for key, value in checkpoint.items():
+        candidates = (key, f"_orig_mod.{key}", key.removeprefix("_orig_mod."))
+        matched_key = next((name for name in candidates if name in model_state), None)
+        if matched_key is None:
+            skipped.append(f"{key}: not present in model")
+            continue
+        if tuple(model_state[matched_key].shape) != tuple(value.shape):
+            skipped.append(
+                f"{matched_key}: checkpoint={tuple(value.shape)} model={tuple(model_state[matched_key].shape)}"
+            )
+            continue
+        filtered[matched_key] = value
+
+    missing, unexpected = model.load_state_dict(filtered, strict=False, assign=True)
+    print(f"HRM checkpoint: loaded {len(filtered)}/{len(model_state)} weight tensors from the pretrained checkpoint")
+    if skipped:
+        print(f"HRM checkpoint: kept randomly-initialized (shape/name mismatch) for {len(skipped)} key(s): {skipped}")
+    if missing:
+        print(f"HRM checkpoint: {len(missing)} model key(s) had no checkpoint match: {list(missing)}")
+    if unexpected:
+        print(f"HRM checkpoint: {len(unexpected)} checkpoint key(s) were unused: {list(unexpected)}")
 
 
 def _load_decoded_hrm_predictions(output_dir: Path) -> list[tuple[list[int], list[int]]]:

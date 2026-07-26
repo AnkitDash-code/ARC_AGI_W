@@ -23,6 +23,13 @@ PENDING_STATES = {"pending", "running", "submitted"}
 FAILURE_STATES = {"error", "failed"}
 
 
+def _status_contains(status: str, states: set[str]) -> bool:
+    # Kaggle's CSV export returns enum-style strings like "SubmissionStatus.PENDING"
+    # (confirmed against a real submission), not the bare word -- exact-match
+    # against PENDING_STATES/FAILURE_STATES silently never matches anything.
+    return any(state in status for state in states)
+
+
 def latest_submission_row(competition: str) -> dict | None:
     result = run_kaggle(["competitions", "submissions", competition, "--csv"])
     if result.returncode != 0:
@@ -52,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             status = str(row.get("status", "")).strip().lower()
             print(f"[score] +{int(elapsed)}s: status={status!r} row={row}")
-            if status not in PENDING_STATES:
+            if not _status_contains(status, PENDING_STATES):
                 break
         if elapsed > args.max_seconds:
             print(f"[score] gave up after {elapsed:.0f}s without a terminal status.", file=sys.stderr)
@@ -71,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[score] public score = {score}")
     print(f"[score] full row written to {report_path}")
 
-    if status in FAILURE_STATES or not score:
+    if _status_contains(status, FAILURE_STATES) or not score:
         print("[score] submission did not score successfully -- check kaggle.com for the error message.", file=sys.stderr)
         return 1
     return 0

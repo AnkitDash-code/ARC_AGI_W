@@ -44,7 +44,10 @@ def click_submit(username: str, slug: str, debug_port: int, screenshot_dir: Path
         return 3
 
     screenshot_dir.mkdir(parents=True, exist_ok=True)
-    kernel_url = f"https://www.kaggle.com/code/{username}/{slug}"
+    # The Submit button lives on the Output tab specifically, not the default
+    # Notebook tab -- confirmed by inspecting a real page (Output > submission.json
+    # row has the "Submit to Competition" button next to the download icon).
+    kernel_url = f"https://www.kaggle.com/code/{username}/{slug}/output"
     print(f"Navigating to {kernel_url}")
     page.get(kernel_url)
     time.sleep(3)  # let the SPA finish rendering the latest version's action buttons

@@ -13,6 +13,12 @@ SRC_ROOT = ROOT / "src" / "mythos"
 # upstream -- see third_party/compress_arc/NOTICE.md), so it gets its own
 # sys.path entry rather than being embedded under src/mythos.
 THIRD_PARTY_ROOT = ROOT / "third_party"
+# agentic_repl is a separate top-level package (see its __init__.py), not
+# part of src/mythos, so it's embedded under its own top-level directory
+# below rather than under src/. models/ is excluded: that holds only the
+# (unrun) staging script + docs for the multi-GB GGUF artifact, which is
+# mounted from a Kaggle Dataset at runtime, never embedded as source.
+AGENTIC_REPL_ROOT = ROOT / "agentic_repl"
 OUTPUT = ROOT / "project_mythos_kaggle_pipeline_standalone.ipynb"
 
 
@@ -43,6 +49,11 @@ def _embedded_files() -> dict[str, str]:
         if path.is_file() and path.suffix in (".py", ".md") or path.name == "LICENSE":
             relative = path.relative_to(ROOT).as_posix()
             files[relative] = path.read_text(encoding="utf-8")
+    for path in sorted(AGENTIC_REPL_ROOT.rglob("*.py")):
+        if path.relative_to(AGENTIC_REPL_ROOT).parts[0] == "models":
+            continue  # staging script only; the model itself is a mounted Kaggle Dataset
+        relative = path.relative_to(ROOT).as_posix()
+        files[relative] = path.read_text(encoding="utf-8")
     return files
 
 
@@ -72,6 +83,30 @@ if str(SRC_DIR) not in sys.path:
 COMPRESS_ARC_DIR = EMBED_ROOT / 'third_party' / 'compress_arc'
 if COMPRESS_ARC_DIR.is_dir() and str(COMPRESS_ARC_DIR) not in sys.path:
     sys.path.insert(0, str(COMPRESS_ARC_DIR))
+
+# agentic_repl is embedded as its own top-level package (agentic_repl/, a
+# sibling of src/), so EMBED_ROOT itself -- not EMBED_ROOT/src -- needs to be
+# on sys.path for `import agentic_repl` to resolve.
+if (EMBED_ROOT / 'agentic_repl').is_dir() and str(EMBED_ROOT) not in sys.path:
+    sys.path.insert(0, str(EMBED_ROOT))
+
+# The agentic-REPL code-LLM's weights are pre-staged as a Kaggle Dataset
+# (see agentic_repl/models/README.md), never downloaded live -- internet is
+# disabled on scored reruns. Autodiscover the mounted .gguf file the same
+# way the HRM checkpoint path is set explicitly above, so LlamaCppClient
+# just reads MYTHOS_AGENTIC_MODEL_PATH without any further wiring.
+if 'MYTHOS_AGENTIC_MODEL_PATH' not in os.environ:
+    _kaggle_input = Path('/kaggle/input')
+    if _kaggle_input.is_dir():
+        # Confirmed directly (not assumed): private dataset inputs mount at
+        # /kaggle/input/datasets/<owner>/<slug>/, not the flatter
+        # /kaggle/input/<slug>/ this repo's HRM checkpoint paths assume --
+        # check both rather than trust either blindly.
+        _gguf_candidates = sorted(_kaggle_input.glob('*/*.gguf')) or sorted(
+            _kaggle_input.glob('datasets/*/*/*.gguf')
+        )
+        if _gguf_candidates:
+            os.environ['MYTHOS_AGENTIC_MODEL_PATH'] = str(_gguf_candidates[0])
 
 print('Embedded Mythos package written to:', SRC_DIR)
 print('Embedded files:', len(EMBEDDED_FILES))
@@ -114,7 +149,11 @@ def build() -> None:
                 "os.environ.setdefault('MYTHOS_TTT_GENIE_WEIGHT', '0.01')\n"
                 "os.environ.setdefault('MYTHOS_TTT_LR', '1e-4')\n"
                 "os.environ.setdefault('MYTHOS_TTT_BATCH_SIZE', '2')\n"
-                "SOLVER_NAME = 'hrm'  # 'pipeline', 'baseline', 'fixture', or 'hrm'\n"
+                "SOLVER_NAME = 'agentic_repl'  # 'pipeline', 'baseline', 'fixture', 'hrm', or 'agentic_repl'\n"
+                "# SMOKE TEST: agentic_repl on real L4x4 hardware, 2 tasks only, before spending\n"
+                "# real GPU quota on a full run -- see agentic_repl/models/README.md. Remove this\n"
+                "# override (or unset MYTHOS_MAX_TASKS) for a real submission.\n"
+                "os.environ.setdefault('MYTHOS_MAX_TASKS', '2')\n"
                 "MODEL_MODE = 'fallback'  # 'fallback' or 'strict' (irrelevant for SOLVER_NAME='hrm', which bypasses ModelRegistry)\n"
                 "# Kaggle competition reruns are internet-disabled, so the HRM repo + checkpoint\n"
                 "# are pre-staged as a Kaggle Dataset (ankitdash24/hrm-arc2-checkpoint) instead of\n"
@@ -254,6 +293,68 @@ def build() -> None:
                 "print('tasks =', len(tasks))\n"
                 "print('train_examples =', train_examples)\n"
                 "print('test_items =', test_items)\n"
+            ),
+            _markdown(
+                "## 4b. Install agentic_repl Runtime Dependencies (offline wheel)\n\n"
+                "`AgenticReplSolver`'s real backend (`LlamaCppClient`) needs "
+                "`llama-cpp-python`, which Kaggle doesn't preinstall. A live `pip "
+                "install` doesn't work here at all: Kaggle's L4 sessions hard-enforce "
+                "no internet regardless of kernel-metadata.json's enable_internet "
+                "setting (confirmed directly -- a live install attempt failed with DNS "
+                "resolution errors even with enable_internet=true). A "
+                "transformers-native GGUF loader was considered as an install-free "
+                "alternative, but transformers doesn't support the qwen3moe "
+                "architecture for GGUF loading yet.\n\n"
+                "Fix: a prebuilt CUDA wheel (`llama_cpp_python-0.3.31-py3-none-"
+                "manylinux_2_35_x86_64.whl`, cu125 -- CUDA is runtime-backward-"
+                "compatible, so this runs fine against Kaggle's newer CUDA), staged as "
+                "the small Kaggle Dataset `agentic-repl-llama-cpp-wheel` and installed "
+                "offline via `pip install --no-index`. This has to run before "
+                "`make_solver()` below, not after like the HRM dependency cell, since "
+                "AgenticReplSolver's constructor loads the model eagerly (unlike "
+                "HRMSolver, which defers its heavy imports)."
+            ),
+            _code(
+                "agentic_setup_ok = True\n\n"
+                "if SOLVER_NAME == 'agentic_repl':\n"
+                "    import subprocess\n"
+                "    try:\n"
+                "        import llama_cpp\n"
+                "        print('llama_cpp already importable:', llama_cpp.__file__)\n"
+                "    except ImportError:\n"
+                "        wheel_dir_candidates = (\n"
+                "            list(Path('/kaggle/input/agentic-repl-llama-cpp-wheel').glob('*'))\n"
+                "            + list(Path('/kaggle/input').glob('datasets/*/agentic-repl-llama-cpp-wheel/*'))\n"
+                "        )\n"
+                "        wheel_files = [p for p in wheel_dir_candidates if p.suffix == '.whl']\n"
+                "        print('found wheel files:', wheel_files)\n"
+                "        if not wheel_files:\n"
+                "            print('WARNING: no staged llama-cpp-python wheel found under /kaggle/input')\n"
+                "            agentic_setup_ok = False\n"
+                "        else:\n"
+                "            install = subprocess.run(\n"
+                "                [sys.executable, '-m', 'pip', 'install', '-v', '--no-index',\n"
+                "                 '--find-links', str(wheel_files[0].parent), 'llama-cpp-python'],\n"
+                "                capture_output=True, text=True, timeout=300,\n"
+                "            )\n"
+                "            print('--- pip stdout (tail) ---')\n"
+                "            print(install.stdout[-3000:])\n"
+                "            if install.returncode != 0:\n"
+                "                print('--- pip stderr (tail) ---')\n"
+                "                print(install.stderr[-3000:])\n"
+                "                agentic_setup_ok = False\n"
+                "            else:\n"
+                "                try:\n"
+                "                    import llama_cpp\n"
+                "                    print('llama_cpp installed and importable:', llama_cpp.__file__)\n"
+                "                except ImportError as exc:\n"
+                "                    print('WARNING: pip install succeeded but import still fails:', repr(exc))\n"
+                "                    agentic_setup_ok = False\n\n"
+                "    if not agentic_setup_ok:\n"
+                "        print('Disabling agentic_repl for this run; falling back to SOLVER_NAME=pipeline.')\n"
+                "        SOLVER_NAME = 'pipeline'\n\n"
+                "print('agentic_setup_ok =', agentic_setup_ok)\n"
+                "print('SOLVER_NAME (post agentic_repl setup) =', SOLVER_NAME)\n"
             ),
             _markdown("## 5. Download Models, Optionally Train Local Stages, Then Load Solver"),
             _code(

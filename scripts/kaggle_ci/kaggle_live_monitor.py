@@ -113,7 +113,7 @@ def monitor(
     try:
         while True:
             packet = page.listen.wait(timeout=30)
-            if packet is None:
+            if not packet:
                 print("[monitor] no packet in 30s (page idle or interception stalled)")
                 continue
             if not packet.response:

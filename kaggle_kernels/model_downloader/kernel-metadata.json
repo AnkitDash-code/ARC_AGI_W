@@ -1,0 +1,17 @@
+{
+  "id": "ankitdash24/agentic-repl-model-downloader",
+  "title": "Agentic REPL Model Downloader",
+  "code_file": "model_downloader.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "ankitdash24/agentic-repl-kaggle-token",
+    "ankitdash24/agentic-repl-hf-token"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

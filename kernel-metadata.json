@@ -6,10 +6,15 @@
   "kernel_type": "notebook",
   "is_private": true,
   "enable_gpu": true,
-  "machine_shape": "NvidiaTeslaT4",
+  "machine_shape": "NvidiaL4",
   "enable_tpu": false,
   "enable_internet": false,
-  "dataset_sources": ["ankitdash24/hrm-arc2-checkpoint"],
+  "dataset_sources": [
+    "ankitdash24/hrm-arc2-checkpoint",
+    "ankitdash24/qwen3-coder-30b-a3b-instruct-gguf",
+    "ankitdash24/agentic-repl-llama-cpp-wheel",
+    "ankitdash24/agentic-repl-arc-agi-2-data"
+  ],
   "competition_sources": ["arc-prize-2026-arc-agi-2"],
   "kernel_sources": []
 }

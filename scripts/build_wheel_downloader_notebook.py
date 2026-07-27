@@ -35,6 +35,13 @@ WHEEL_URL = (
 )
 WHEEL_FILE = "llama_cpp_python-0.3.31-py3-none-manylinux_2_35_x86_64.whl"
 EXPECTED_SIZE_BYTES = 1832490513  # confirmed via HEAD request against WHEEL_URL
+
+# llama-cpp-python's one pure-python dependency not already on Kaggle's image
+# (confirmed via a real offline-install attempt: numpy/typing_extensions were
+# already satisfied, diskcache was not -- "ERROR: Could not find a version
+# that satisfies the requirement diskcache>=5.6.1 ... No matching
+# distribution found", since --no-index blocks PyPI entirely).
+EXTRA_PYPI_PACKAGES = ["diskcache"]
 TARGET_DATASET_ID = "ankitdash24/agentic-repl-llama-cpp-wheel"
 TARGET_DATASET_TITLE = "agentic-repl-llama-cpp-wheel"
 CREDENTIALS_DATASET_SLUG = "agentic-repl-kaggle-token"
@@ -150,7 +157,24 @@ def build() -> None:
                 "    names = archive.namelist()\n"
                 "print(f'Valid zip archive, {len(names)} entries, e.g.:', names[:5])\n"
             ),
-            _markdown("## 4. Publish as a Kaggle Dataset"),
+            _markdown(
+                "## 4. Download extra pure-Python dependencies not already on Kaggle"
+            ),
+            _code(
+                f"EXTRA_PACKAGES = {EXTRA_PYPI_PACKAGES!r}\n"
+                "for package in EXTRA_PACKAGES:\n"
+                "    result = subprocess.run(\n"
+                "        [sys.executable, '-m', 'pip', 'download', package, '--no-deps', '-d', str(WHEEL_DIR)],\n"
+                "        capture_output=True, text=True, timeout=120,\n"
+                "    )\n"
+                "    print(f'--- pip download {package} ---')\n"
+                "    print(result.stdout[-1500:])\n"
+                "    if result.returncode != 0:\n"
+                "        print(result.stderr[-1500:])\n"
+                "    result.check_returncode()\n"
+                "print('files in WHEEL_DIR now:', sorted(p.name for p in WHEEL_DIR.glob('*.whl')))\n"
+            ),
+            _markdown("## 5. Publish as a Kaggle Dataset"),
             _code(
                 "import json as json_module\n\n"
                 f"TARGET_DATASET_ID = {TARGET_DATASET_ID!r}\n"

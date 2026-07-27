@@ -76,7 +76,7 @@ class LlamaCppClient:
         model_path: str | None = None,
         *,
         n_gpu_layers: int = -1,
-        n_ctx: int = 8192,
+        n_ctx: int = 32768,
     ) -> None:
         try:
             from llama_cpp import Llama

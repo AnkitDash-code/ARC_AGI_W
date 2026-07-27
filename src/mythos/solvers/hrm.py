@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import importlib
 import json
@@ -10,7 +11,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from mythos.arc import ArcTask
+from mythos.arc import ArcTask, Grid
+from mythos.augment import inverse_transform, transform_task
 from mythos.features import ARC_MAX_SIZE, hrm_sequence_to_grid, output_shape_hint
 from mythos.hrm_dataset import build_hrm_dataset, default_run_dir, prepare_hrm_raw_dataset
 from mythos.losses import genie_background_consistency_loss
@@ -246,6 +248,14 @@ class TTTConfig:
     # for TTT "hallucinating" -- objects vanishing, backgrounds recoloring --
     # under pure demo-pair supervision. 0 disables it.
     genie_weight: float = 0.1
+    # Dihedral transform indices (see mythos.augment) to ensemble across at
+    # inference: each gets its own from-scratch TTT fit (demo pairs and test
+    # input transformed together, so any orientation-dependent rule stays
+    # internally consistent) and the un-augmented predictions are voted
+    # over. (0,) = identity only, i.e. ensembling disabled -- the original
+    # single-view behavior. Costs roughly len(ensemble_transforms)x the TTT
+    # compute per task, so keep this short.
+    ensemble_transforms: tuple[int, ...] = (0,)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -256,6 +266,7 @@ class TTTConfig:
             "explosion_grad_norm": self.explosion_grad_norm,
             "batch_size": self.batch_size,
             "genie_weight": self.genie_weight,
+            "ensemble_transforms": list(self.ensemble_transforms),
         }
 
 
@@ -293,8 +304,32 @@ class HRMTTTRunner:
 
         predictions: list[Prediction] = []
         for task in task_list:
-            predictions.append(self._solve_one_task_with_ttt(task))
+            predictions.append(self._solve_one_task_ensembled(task))
         return predictions
+
+    def _solve_one_task_ensembled(self, task: ArcTask) -> Prediction:
+        transform_indices = self.ttt.ensemble_transforms or (0,)
+        if tuple(transform_indices) == (0,):
+            return self._solve_one_task_with_ttt(task)  # unchanged single-view path
+
+        # Per test item, every un-augmented candidate grid seen across views
+        # (both attempts from every view all count as votes).
+        candidates_per_item: list[list[Grid]] = [[] for _ in task.test]
+        for index in transform_indices:
+            view_task = task if index == 0 else transform_task(task, index, id_suffix=f"__aug{index}")
+            try:
+                prediction = self._solve_one_task_with_ttt(view_task)
+            except Exception as exc:  # noqa: BLE001 - one bad view must not sink the whole ensemble
+                print(f"TTT: {task.id}: ensemble view {index} failed: {exc!r}; skipping this view")
+                continue
+            for item_index, output in enumerate(prediction.outputs):
+                candidates_per_item[item_index].append(inverse_transform(index, output.attempt_1))
+                candidates_per_item[item_index].append(inverse_transform(index, output.attempt_2))
+
+        attempts: list[tuple[Grid, Grid]] = []
+        for candidates in candidates_per_item:
+            attempts.append(_top_two_by_vote(candidates))
+        return make_prediction(task, attempts)
 
     def _ensure_model_loaded(self, task_list: list[ArcTask]) -> None:
         if self._train_state is not None:
@@ -495,6 +530,18 @@ class HRMTTTRunner:
         pretrain.evaluate(config, train_state, eval_loader, eval_metadata, rank=0, world_size=1)
         tokens = _load_decoded_hrm_predictions(output_dir)
         return HRMInferenceRunner(self.env)._tokens_to_prediction(task, tokens)
+
+
+def _top_two_by_vote(candidates: list[Grid]) -> tuple[Grid, Grid]:
+    """Pick the two most-common grids among candidates (majority vote across ensemble views)."""
+
+    if not candidates:
+        return [[0]], [[0]]
+    counts = Counter(tuple(tuple(row) for row in grid) for grid in candidates)
+    ranked = [[list(row) for row in flat] for flat, _ in counts.most_common(2)]
+    if len(ranked) == 1:
+        ranked.append(ranked[0])
+    return ranked[0], ranked[1]
 
 
 def _load_hrm_config(checkpoint_path: Path, *, dataset_dir: Path, output_dir: Path):  # type: ignore[no-untyped-def]

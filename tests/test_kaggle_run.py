@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 
 from mythos.arc import ArcExample, ArcTask
-from mythos.kaggle_run import main, resolve_challenge_path, solve_with_fallback
+from mythos.kaggle_run import main, parse_ensemble_transforms, resolve_challenge_path, solve_symbolic_first, solve_with_fallback
 from mythos.solvers.baseline import BaselineSolver
 from mythos.submission import load_submission
 
@@ -44,6 +44,35 @@ def test_solve_with_fallback_recovers_when_fallback_also_fails() -> None:
     assert prediction.task_id == "toy"
     assert len(prediction.outputs) == len(task.test)
     assert prediction.outputs[0].attempt_2 == [[0]]
+
+
+def test_parse_ensemble_transforms_parses_comma_separated_indices() -> None:
+    assert parse_ensemble_transforms("0,2,5") == (0, 2, 5)
+
+
+def test_parse_ensemble_transforms_defaults_to_identity_only_when_blank() -> None:
+    assert parse_ensemble_transforms("") == (0,)
+    assert parse_ensemble_transforms("0") == (0,)
+
+
+def test_solve_symbolic_first_partitions_tasks_by_whether_they_verify() -> None:
+    grid = [[1, 2], [3, 4]]
+    mirrored = [row[::-1] for row in grid]
+    solvable = ArcTask(
+        id="solvable",
+        train=(ArcExample(input=grid, output=mirrored),),
+        test=(ArcExample(input=grid),),
+    )
+    unsolvable = ArcTask(
+        id="unsolvable",
+        train=(ArcExample(input=[[1, 2]], output=[[3, 4, 5]]),),
+        test=(ArcExample(input=[[1, 2]]),),
+    )
+
+    solved, remaining = solve_symbolic_first([solvable, unsolvable])
+
+    assert set(solved) == {"solvable"}
+    assert [task.id for task in remaining] == ["unsolvable"]
 
 
 def test_kaggle_runner_writes_submission_from_explicit_challenges(tmp_path: Path) -> None:

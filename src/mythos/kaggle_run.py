@@ -76,6 +76,13 @@ def solve_with_fallback(solver, fallback_solver, task: ArcTask) -> Prediction:
     return make_prediction(task, attempts)
 
 
+def parse_ensemble_transforms(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated list of dihedral transform indices, e.g. '0,2,5'."""
+
+    indices = tuple(int(part) for part in value.split(",") if part.strip())
+    return indices or (0,)
+
+
 def solve_symbolic_first(tasks: list[ArcTask]) -> tuple[dict[str, Prediction], list[ArcTask]]:
     """Try the verified symbolic solver on every task before spending neural compute.
 
@@ -134,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
                             lr=float(os.environ.get("MYTHOS_TTT_LR", "1e-3")),
                             batch_size=int(os.environ.get("MYTHOS_TTT_BATCH_SIZE", "2")),
                             genie_weight=float(os.environ.get("MYTHOS_TTT_GENIE_WEIGHT", "0.1")),
+                            ensemble_transforms=parse_ensemble_transforms(
+                                os.environ.get("MYTHOS_TTT_ENSEMBLE", "0")
+                            ),
                         ),
                         num_aug=int(os.environ.get("MYTHOS_TTT_NUM_AUG", "0")),
                     )

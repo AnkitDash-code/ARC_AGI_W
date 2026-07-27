@@ -90,8 +90,10 @@ def build() -> None:
                 "# implemented in mythos.losses but never wired into any training loop) and wider\n"
                 "# LoRA target modules (MLP layers, not just attention) -- against the evaluation\n"
                 "# split's known solutions before spending the daily submission quota again.\n"
-                "SPLIT = 'test'  # 'evaluation' was used for diagnostic runs against known solutions; 'test' is the real submission split\n"
-                "os.environ.setdefault('MYTHOS_TTT_STEPS', '200')\n"
+                "SPLIT = 'evaluation'  # DIAGNOSTIC: validating the fragment-to-slot DSL + inference-time ensembling against known solutions before a real submission; switch back to 'test' afterward\n"
+                "os.environ.setdefault('MYTHOS_MAX_TASKS', '10')  # DIAGNOSTIC: unset for a real run -- truncates the submission otherwise\n"
+                "os.environ.setdefault('MYTHOS_TTT_STEPS', '100')  # halved vs the steps=200 single-view baseline (v48), so total TTT compute is roughly comparable to a 2-view ensemble\n"
+                "os.environ.setdefault('MYTHOS_TTT_ENSEMBLE', '0,4')  # DIAGNOSTIC: identity + mirror_horizontal views, voted\n"
                 "os.environ.setdefault('MYTHOS_TTT_NUM_AUG', '8')\n"
                 "os.environ.setdefault('MYTHOS_TTT_RANK', '16')\n"
                 "os.environ.setdefault('MYTHOS_TTT_GENIE_WEIGHT', '0.01')\n"
@@ -193,6 +195,7 @@ def build() -> None:
                 "print('MYTHOS_TTT_LR =', os.environ.get('MYTHOS_TTT_LR'))\n"
                 "print('MYTHOS_TTT_BATCH_SIZE =', os.environ.get('MYTHOS_TTT_BATCH_SIZE'))\n"
                 "print('MYTHOS_TTT_GENIE_WEIGHT =', os.environ.get('MYTHOS_TTT_GENIE_WEIGHT'))\n"
+                "print('MYTHOS_TTT_ENSEMBLE =', os.environ.get('MYTHOS_TTT_ENSEMBLE'))\n"
             ),
             _markdown("## 3. Import Mythos Runtime"),
             _code(
@@ -471,7 +474,7 @@ def build() -> None:
                 "if SOLVER_NAME == 'hrm':\n"
                 "    from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner, HRMTTTRunner, TTTConfig\n"
                 "    from mythos.solvers.symbolic import SymbolicSolver\n"
-                "    from mythos.kaggle_run import solve_symbolic_first\n"
+                "    from mythos.kaggle_run import parse_ensemble_transforms, solve_symbolic_first\n"
                 "    symbolic_predictions, remaining_tasks = solve_symbolic_first(list(tasks.values()))\n"
                 "    print(f'symbolic solver: {len(symbolic_predictions)}/{len(tasks)} tasks solved with a train-verified rule; {len(remaining_tasks)} sent to HRM')\n"
                 "    try:\n"
@@ -486,6 +489,7 @@ def build() -> None:
                 "                    lr=float(os.environ.get('MYTHOS_TTT_LR', '1e-3')),\n"
                 "                    batch_size=int(os.environ.get('MYTHOS_TTT_BATCH_SIZE', '2')),\n"
                 "                    genie_weight=float(os.environ.get('MYTHOS_TTT_GENIE_WEIGHT', '0.1')),\n"
+                "                    ensemble_transforms=parse_ensemble_transforms(os.environ.get('MYTHOS_TTT_ENSEMBLE', '0')),\n"
                 "                ),\n"
                 "                num_aug=int(os.environ.get('MYTHOS_TTT_NUM_AUG', '0')),\n"
                 "            )\n"

@@ -12,11 +12,19 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Only needed for the real agentic_repl solver backend (LlamaCppClient).
+# FakeLLMClient (tests, scripts/benchmark_agentic_repl.py --llm-client stub)
+# needs none of this -- see agentic_repl/models/README.md.
+agentic = ["llama-cpp-python"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." (repo root) makes the agentic_repl/ top-level package importable the
+# same way "src" makes mythos importable -- agentic_repl is deliberately
+# kept out of the project-mythos distribution itself (see
+# agentic_repl/__init__.py's module docstring).
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-ra"

@@ -26,4 +26,13 @@ def make_solver(name: str, *, model_mode: str | None = None):
         return SymbolicSolver()
     if name == "hrm":
         return HRMSolver()
+    if name == "agentic_repl":
+        # Local import: agentic_repl/ is a separate top-level package (kept
+        # apart from the shelved neural path here in src/mythos), and its
+        # real LLM backend needs llama-cpp-python -- selecting any other
+        # solver should never require that dependency to be installed.
+        from agentic_repl.llm.client import LlamaCppClient
+        from agentic_repl.solver import AgenticReplSolver
+
+        return AgenticReplSolver(LlamaCppClient())
     raise ValueError(f"unknown solver: {name}")

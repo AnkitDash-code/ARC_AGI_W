@@ -13,7 +13,11 @@ from mythos.submission import write_submission
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a Mythos solver.")
-    parser.add_argument("--solver", choices=["pipeline", "baseline", "fixture", "symbolic", "hrm"], default="pipeline")
+    parser.add_argument(
+        "--solver",
+        choices=["pipeline", "baseline", "fixture", "symbolic", "hrm", "agentic_repl"],
+        default="pipeline",
+    )
     parser.add_argument("--model-mode", choices=["fallback", "strict"], default=None)
     parser.add_argument("--challenges", required=True, help="Path to ARC-style challenges JSON.")
     parser.add_argument("--out", required=True, help="Output submission JSON path.")

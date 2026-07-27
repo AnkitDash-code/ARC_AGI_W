@@ -8,6 +8,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src" / "mythos"
+# Vendored third-party code that isn't part of the mythos package (keeps its
+# own top-level import style, e.g. `import arc_compressor`, unmodified from
+# upstream -- see third_party/compress_arc/NOTICE.md), so it gets its own
+# sys.path entry rather than being embedded under src/mythos.
+THIRD_PARTY_ROOT = ROOT / "third_party"
 OUTPUT = ROOT / "project_mythos_kaggle_pipeline_standalone.ipynb"
 
 
@@ -34,6 +39,10 @@ def _embedded_files() -> dict[str, str]:
     for path in sorted(SRC_ROOT.rglob("*.py")):
         relative = path.relative_to(ROOT).as_posix()
         files[relative] = path.read_text(encoding="utf-8")
+    for path in sorted(THIRD_PARTY_ROOT.rglob("*")):
+        if path.is_file() and path.suffix in (".py", ".md") or path.name == "LICENSE":
+            relative = path.relative_to(ROOT).as_posix()
+            files[relative] = path.read_text(encoding="utf-8")
     return files
 
 
@@ -56,6 +65,13 @@ for relative_path, content in EMBEDDED_FILES.items():
 SRC_DIR = EMBED_ROOT / 'src'
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+# Vendored third-party code (e.g. CompressARC) keeps its own top-level
+# import style (`import arc_compressor`, not a package), so its directory
+# goes on sys.path directly rather than under src/.
+COMPRESS_ARC_DIR = EMBED_ROOT / 'third_party' / 'compress_arc'
+if COMPRESS_ARC_DIR.is_dir() and str(COMPRESS_ARC_DIR) not in sys.path:
+    sys.path.insert(0, str(COMPRESS_ARC_DIR))
 
 print('Embedded Mythos package written to:', SRC_DIR)
 print('Embedded files:', len(EMBEDDED_FILES))

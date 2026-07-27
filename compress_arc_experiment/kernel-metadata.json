@@ -1,0 +1,15 @@
+{
+  "id": "ankitdash24/compressarc-timing-experiment",
+  "title": "CompressARC Timing Experiment",
+  "code_file": "compress_arc_timing_test.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": ["arc-prize-2026-arc-agi-2"],
+  "kernel_sources": []
+}

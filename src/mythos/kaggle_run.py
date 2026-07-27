@@ -15,6 +15,7 @@ from mythos.solvers.base import SolverError, make_prediction
 from mythos.solvers.baseline import BaselineSolver
 from mythos.solvers.factory import make_solver
 from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner, HRMTTTRunner, TTTConfig
+from mythos.solvers.symbolic import SymbolicSolver
 from mythos.submission import Prediction, write_submission
 
 DEFAULT_KAGGLE_DATA_DIR = Path("/kaggle/input/competitions/arc-prize-2026-arc-agi-2")
@@ -75,6 +76,26 @@ def solve_with_fallback(solver, fallback_solver, task: ArcTask) -> Prediction:
     return make_prediction(task, attempts)
 
 
+def solve_symbolic_first(tasks: list[ArcTask]) -> tuple[dict[str, Prediction], list[ArcTask]]:
+    """Try the verified symbolic solver on every task before spending neural compute.
+
+    SymbolicSolver only ever returns a prediction that exactly reproduces
+    every train pair -- it never guesses -- so this is a strictly free win
+    layered ahead of any other solver: whatever it solves is solved for
+    certain, and everything else falls through unchanged to the caller.
+    """
+
+    symbolic_solver = SymbolicSolver()
+    solved: dict[str, Prediction] = {}
+    remaining: list[ArcTask] = []
+    for task in tasks:
+        try:
+            solved[task.id] = symbolic_solver.solve(task)
+        except SolverError:
+            remaining.append(task)
+    return solved, remaining
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Mythos against Kaggle ARC-AGI data.")
     parser.add_argument("--data-dir", default=str(DEFAULT_KAGGLE_DATA_DIR))
@@ -95,6 +116,12 @@ def main(argv: list[str] | None = None) -> int:
         solver = make_solver(args.solver, model_mode=args.model_mode)
         fallback_solver = solver if isinstance(solver, BaselineSolver) else BaselineSolver()
         if args.solver == "hrm":
+            symbolic_predictions, remaining_tasks = solve_symbolic_first(list(tasks.values()))
+            print(
+                f"symbolic solver: {len(symbolic_predictions)}/{len(tasks)} tasks solved with a "
+                f"train-verified rule; {len(remaining_tasks)} sent to HRM",
+                file=sys.stderr,
+            )
             try:
                 env = HRMEnvironment.from_env()
                 env.validate(require_cuda=True)
@@ -112,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     runner = HRMInferenceRunner(env)
-                predictions = runner.solve_tasks(list(tasks.values()))
+                hrm_predictions = runner.solve_tasks(remaining_tasks) if remaining_tasks else []
             except Exception as exc:  # noqa: BLE001 - HRM batch failure must not abort the run
                 print(f"WARNING: HRM batch run failed: {exc!r}; using baseline fallback for all tasks", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
@@ -122,7 +149,11 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(exc, "stderr", None):
                     print("--- subprocess stderr (tail) ---", file=sys.stderr)
                     print(exc.stderr[-4000:], file=sys.stderr)
-                predictions = [fallback_solver.solve(task) for task in tasks.values()]
+                hrm_predictions = [fallback_solver.solve(task) for task in remaining_tasks]
+            hrm_predictions_by_id = {prediction.task_id: prediction for prediction in hrm_predictions}
+            predictions = [
+                symbolic_predictions.get(task.id) or hrm_predictions_by_id[task.id] for task in tasks.values()
+            ]
         else:
             predictions = [solve_with_fallback(solver, fallback_solver, task) for task in tasks.values()]
         write_submission(predictions, args.out)

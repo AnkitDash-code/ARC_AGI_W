@@ -8,6 +8,7 @@ from mythos.solvers.baseline import BaselineSolver
 from mythos.solvers.fixture import FixtureSolver
 from mythos.solvers.hrm import HRMSolver
 from mythos.solvers.pipeline import PlannedPipelineSolver
+from mythos.solvers.symbolic import SymbolicSolver
 
 
 def make_solver(name: str, *, model_mode: str | None = None):
@@ -21,6 +22,8 @@ def make_solver(name: str, *, model_mode: str | None = None):
         return BaselineSolver()
     if name == "fixture":
         return FixtureSolver()
+    if name == "symbolic":
+        return SymbolicSolver()
     if name == "hrm":
         return HRMSolver()
     raise ValueError(f"unknown solver: {name}")

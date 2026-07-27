@@ -11,6 +11,7 @@ for precision: it will never guess.
 from __future__ import annotations
 
 from mythos.arc import ArcTask, Grid, grid_equal
+from mythos.object_ops import ALL_OBJECT_TRANSFORM_FINDERS
 from mythos.objects import ArcObject
 from mythos.solvers.base import SolverError, make_prediction
 from mythos.solvers.fixture import FixtureSolver
@@ -34,7 +35,26 @@ class SymbolicSolver:
         prediction = _try_symmetry_repair(task)
         if prediction is not None:
             return prediction
+        prediction = _try_object_transforms(task)
+        if prediction is not None:
+            return prediction
         return self.fixture_solver.solve(task)
+
+
+def _try_object_transforms(task: ArcTask) -> Prediction | None:
+    for find_transform in ALL_OBJECT_TRANSFORM_FINDERS:
+        transform = find_transform(task)
+        if transform is None:
+            continue
+        try:
+            attempts = [(transform(example.input), transform(example.input)) for example in task.test]
+        except Exception:  # noqa: BLE001 - any failure applying to test just means this candidate doesn't fire
+            continue
+        try:
+            return make_prediction(task, attempts)
+        except SolverError:
+            continue
+    return None
 
 
 def _try_symmetry_repair(task: ArcTask) -> Prediction | None:

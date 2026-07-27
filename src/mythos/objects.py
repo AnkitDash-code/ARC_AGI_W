@@ -4,8 +4,8 @@ Raw grid tokens are a poor substrate for compositional rules ("move this
 fragment into its matching slot" is a one-line rule over objects and a
 near-impossible one over 900 flat pixels). This module segments a grid into
 connected-component objects with shape/color/position attributes, so
-downstream primitives (mythos.dsl) and program search (mythos.program_search)
-can operate over objects instead of raw cells.
+downstream primitives (mythos.object_ops) can operate over objects instead
+of raw cells.
 """
 
 from __future__ import annotations
@@ -157,3 +157,27 @@ def crop_to_object(grid: Grid, obj: ArcObject, *, background: int = 0) -> Grid:
 def dominant_grid_color(grid: Grid) -> int:
     counts = Counter(cell for row in grid for cell in row)
     return counts.most_common(1)[0][0]
+
+
+def d4_signature_variants(signature: frozenset[Cell]) -> list[frozenset[Cell]]:
+    """All 8 dihedral-group transforms of a shape signature, each renormalized to (0,0).
+
+    Used to match a donor fragment's silhouette against a target slot's
+    silhouette allowing for the donor having been rotated/reflected before
+    being placed -- a common ARC pattern ("fit this piece into its outline,
+    turned whichever way makes it fit").
+    """
+
+    variants: list[frozenset[Cell]] = []
+    current = signature
+    for _ in range(4):
+        variants.append(_normalize_signature(current))
+        variants.append(_normalize_signature(frozenset((r, -c) for r, c in current)))
+        current = frozenset((c, -r) for r, c in current)  # rotate 90 degrees
+    return variants
+
+
+def _normalize_signature(cells: frozenset[Cell]) -> frozenset[Cell]:
+    min_r = min(r for r, _ in cells)
+    min_c = min(c for _, c in cells)
+    return frozenset((r - min_r, c - min_c) for r, c in cells)

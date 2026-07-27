@@ -10,6 +10,8 @@ solver-factory fallback chain as the existing solvers.
 
 from __future__ import annotations
 
+import os
+
 from mythos.arc import ArcTask, Grid, grid_equal
 from mythos.solvers.base import SolverError, make_prediction
 from mythos.submission import Prediction
@@ -23,6 +25,17 @@ from agentic_repl.repl import ExecutionResult, run_candidate
 DEFAULT_NUM_CANDIDATES = 4
 DEFAULT_REFINEMENT_ROUNDS = 2
 DEFAULT_TIMEOUT_SECONDS = 2.0
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("MYTHOS_AGENTIC_DEBUG") == "1"
+
+
+def _debug_log(label: str, text: str, *, limit: int = 800) -> None:
+    if not _debug_enabled():
+        return
+    truncated = text if len(text) <= limit else text[:limit] + f"... [{len(text) - limit} more chars]"
+    print(f"[agentic_repl debug] {label}:\n{truncated}")
 
 
 def _failure_report(train_index: int, result: ExecutionResult, expected: Grid) -> str:
@@ -74,10 +87,14 @@ class AgenticReplSolver:
 
     def _search_verified_programs(self, task: ArcTask) -> list[str]:
         prompt = build_initial_prompt(task, self._dsl_catalog)
-        candidates = [
-            extract_code_block(completion)
-            for completion in self._llm_client.generate(prompt, n=self._num_candidates)
-        ]
+        _debug_log(f"{task.id} initial prompt", prompt, limit=1500)
+        raw_completions = self._llm_client.generate(prompt, n=self._num_candidates)
+        candidates = []
+        for index, completion in enumerate(raw_completions):
+            _debug_log(f"{task.id} candidate {index} raw completion", completion)
+            code = extract_code_block(completion)
+            _debug_log(f"{task.id} candidate {index} extracted code", code)
+            candidates.append(code)
 
         verified: list[str] = []
         for code in candidates:
@@ -91,6 +108,7 @@ class AgenticReplSolver:
         attempts_left = self._refinement_rounds + 1
         while attempts_left > 0:
             ok, failure = _verify_on_train(current, task, timeout_s=self._timeout_s)
+            _debug_log(f"{task.id} verify result", f"ok={ok} failure={failure}")
             if ok:
                 return current
             attempts_left -= 1
@@ -100,5 +118,6 @@ class AgenticReplSolver:
             completions = self._llm_client.generate(refinement_prompt, n=1)
             if not completions:
                 return None
+            _debug_log(f"{task.id} refinement raw completion", completions[0])
             current = extract_code_block(completions[0])
         return None

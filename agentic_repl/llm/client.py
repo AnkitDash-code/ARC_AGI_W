@@ -100,13 +100,18 @@ class LlamaCppClient:
         )
 
     def generate(self, prompt: str, *, n: int, temperature: float = 0.7) -> list[str]:
+        # create_chat_completion (not create_completion) so llama.cpp applies
+        # the GGUF's embedded chat template -- Qwen3-Coder-Instruct was
+        # fine-tuned to expect its chat format, and a first real run against
+        # it via raw create_completion verified 0/30 candidates on real
+        # ARC-AGI-2 training tasks, consistent with the model not being
+        # prompted the way it was tuned to respond to.
         completions = []
         for _ in range(n):
-            result = self._llama.create_completion(
-                prompt,
+            result = self._llama.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=1024,
                 temperature=temperature,
-                stop=["```\n\n", "<|im_end|>"],
             )
-            completions.append(result["choices"][0]["text"])
+            completions.append(result["choices"][0]["message"]["content"] or "")
         return completions

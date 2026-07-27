@@ -219,8 +219,17 @@ def hrm_sequence_to_grid(
     ]
 
 
-def output_shape_hint(task: ArcTask, input_grid: Grid) -> tuple[int, int]:
-    """Choose a conservative output shape before a model predicts EOS tokens."""
+def output_shape_hint(task: ArcTask, input_grid: Grid) -> tuple[int, int] | None:
+    """Choose an output shape only when train examples agree on one.
+
+    When train output shapes disagree (common for crop/symmetry-repair
+    tasks, where the output size is the bounding box of some occluded
+    region and varies per example), there is no safe static guess -- return
+    None so the caller falls back to the model's own predicted EOS boundary
+    markers (see `_infer_shape_from_eos`) instead of forcing the full input
+    grid's shape, which is virtually never correct for this task family and
+    makes exact-match scoring impossible regardless of prediction quality.
+    """
 
     shapes = {
         (len(example.output), len(example.output[0]))
@@ -229,7 +238,7 @@ def output_shape_hint(task: ArcTask, input_grid: Grid) -> tuple[int, int]:
     }
     if len(shapes) == 1:
         return next(iter(shapes))
-    return len(input_grid), len(input_grid[0])
+    return None
 
 
 def embedding_cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -260,9 +269,32 @@ def _infer_shape_from_eos(matrix: Sequence[Sequence[int]], *, max_size: int) -> 
         sum(1 for row_index in range(max_size) if matrix[row_index][col_index] == 1)
         for col_index in range(max_size)
     ]
-    height = next((index for index, score in enumerate(row_scores) if score >= 2), max_size)
-    width = next((index for index, score in enumerate(col_scores) if score >= 2), max_size)
+    height = _best_boundary_index(row_scores, max_size)
+    width = _best_boundary_index(col_scores, max_size)
     return max(1, height), max(1, width)
+
+
+def _best_boundary_index(scores: Sequence[int], default: int, *, min_score: int = 2) -> int:
+    """Pick the index most likely to be the EOS boundary marker.
+
+    Per `grid_to_hrm_sequence`, every in-grid row/column already carries
+    exactly one legitimate stray EOS(=1) token from the *orthogonal*
+    boundary marker (the EOS column marks every content row; the EOS row
+    marks every content column). A low fixed threshold is therefore
+    trivially false-triggered by that baseline plus a single unit of
+    prediction noise on some earlier row/column. The genuine boundary
+    instead carries a full run of EOS tokens -- one per in-grid cell along
+    that axis -- so picking the argmax (not the first index crossing a low
+    threshold) is far more robust to noisy raw predictions.
+    """
+
+    best_index = default
+    best_score = min_score - 1
+    for index, score in enumerate(scores):
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index if best_score >= min_score else default
 
 
 def _token_to_color(token: int) -> int:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import traceback
@@ -13,7 +14,7 @@ from mythos.metrics import score_files
 from mythos.solvers.base import SolverError, make_prediction
 from mythos.solvers.baseline import BaselineSolver
 from mythos.solvers.factory import make_solver
-from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner
+from mythos.solvers.hrm import HRMEnvironment, HRMInferenceRunner, HRMTTTRunner, TTTConfig
 from mythos.submission import Prediction, write_submission
 
 DEFAULT_KAGGLE_DATA_DIR = Path("/kaggle/input/competitions/arc-prize-2026-arc-agi-2")
@@ -97,7 +98,21 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 env = HRMEnvironment.from_env()
                 env.validate(require_cuda=True)
-                predictions = HRMInferenceRunner(env).solve_tasks(list(tasks.values()))
+                if os.environ.get("MYTHOS_ENABLE_TTT") == "1":
+                    runner = HRMTTTRunner(
+                        env,
+                        ttt=TTTConfig(
+                            rank=int(os.environ.get("MYTHOS_TTT_RANK", "16")),
+                            steps=int(os.environ.get("MYTHOS_TTT_STEPS", "20")),
+                            lr=float(os.environ.get("MYTHOS_TTT_LR", "1e-3")),
+                            batch_size=int(os.environ.get("MYTHOS_TTT_BATCH_SIZE", "2")),
+                            genie_weight=float(os.environ.get("MYTHOS_TTT_GENIE_WEIGHT", "0.1")),
+                        ),
+                        num_aug=int(os.environ.get("MYTHOS_TTT_NUM_AUG", "0")),
+                    )
+                else:
+                    runner = HRMInferenceRunner(env)
+                predictions = runner.solve_tasks(list(tasks.values()))
             except Exception as exc:  # noqa: BLE001 - HRM batch failure must not abort the run
                 print(f"WARNING: HRM batch run failed: {exc!r}; using baseline fallback for all tasks", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)

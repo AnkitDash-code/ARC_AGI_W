@@ -83,8 +83,15 @@ class LoRALinear(_BASE_MODULE):
         self.alpha = float(alpha if alpha is not None else rank)
         self.scaling = self.alpha / float(rank)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.lora_a = nn.Parameter(torch.empty(rank, base_layer.in_features))
-        self.lora_b = nn.Parameter(torch.zeros(base_layer.out_features, rank))
+        # Match the base layer's device/dtype: creating these as plain CPU/fp32
+        # tensors breaks torch.compile'd models (HRM runs compiled on CUDA in
+        # bfloat16) -- confirmed by a real run: Dynamo's tracer rejected the
+        # LoRA matmul with "Unhandled FakeTensor Device Propagation ... found
+        # two different devices cuda:0, cpu".
+        base_device = base_layer.weight.device
+        base_dtype = base_layer.weight.dtype
+        self.lora_a = nn.Parameter(torch.empty(rank, base_layer.in_features, device=base_device, dtype=base_dtype))
+        self.lora_b = nn.Parameter(torch.zeros(base_layer.out_features, rank, device=base_device, dtype=base_dtype))
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
         for parameter in self.base_layer.parameters():
@@ -93,7 +100,14 @@ class LoRALinear(_BASE_MODULE):
     def forward(self, inputs):  # type: ignore[no-untyped-def]
         torch = _torch()
         base = self.base_layer(inputs)
-        update = self.dropout(inputs).matmul(self.lora_a.transpose(0, 1))
+        # CastedLinear (and some plain Linear layers under mixed precision) stores
+        # its weight in one dtype (fp32) but receives activations in another
+        # (bf16) -- cast the activation to lora_a's dtype before this matmul, not
+        # base_layer.weight's dtype, since those two can legitimately differ.
+        # Confirmed by a real run: "expected mat1 and mat2 to have the same
+        # dtype, but got: c10::BFloat16 != float" once the device mismatch (the
+        # earlier bug) was fixed.
+        update = self.dropout(inputs).to(dtype=self.lora_a.dtype).matmul(self.lora_a.transpose(0, 1))
         update = update.matmul(self.lora_b.transpose(0, 1))
         return base + update.to(dtype=base.dtype) * torch.as_tensor(self.scaling, dtype=base.dtype, device=base.device)
 
@@ -123,8 +137,12 @@ class LoRACastedLinear(_BASE_MODULE):
         self.alpha = float(alpha if alpha is not None else rank)
         self.scaling = self.alpha / float(rank)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.lora_a = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_b = nn.Parameter(torch.zeros(out_features, rank))
+        # See LoRALinear's identical comment: must match the base layer's
+        # device/dtype or torch.compile'd forward passes fail to trace.
+        base_device = base_layer.weight.device
+        base_dtype = base_layer.weight.dtype
+        self.lora_a = nn.Parameter(torch.empty(rank, in_features, device=base_device, dtype=base_dtype))
+        self.lora_b = nn.Parameter(torch.zeros(out_features, rank, device=base_device, dtype=base_dtype))
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
         for parameter in self.base_layer.parameters():
@@ -133,7 +151,14 @@ class LoRACastedLinear(_BASE_MODULE):
     def forward(self, inputs):  # type: ignore[no-untyped-def]
         torch = _torch()
         base = self.base_layer(inputs)
-        update = self.dropout(inputs).matmul(self.lora_a.transpose(0, 1))
+        # CastedLinear (and some plain Linear layers under mixed precision) stores
+        # its weight in one dtype (fp32) but receives activations in another
+        # (bf16) -- cast the activation to lora_a's dtype before this matmul, not
+        # base_layer.weight's dtype, since those two can legitimately differ.
+        # Confirmed by a real run: "expected mat1 and mat2 to have the same
+        # dtype, but got: c10::BFloat16 != float" once the device mismatch (the
+        # earlier bug) was fixed.
+        update = self.dropout(inputs).to(dtype=self.lora_a.dtype).matmul(self.lora_a.transpose(0, 1))
         update = update.matmul(self.lora_b.transpose(0, 1))
         return base + update.to(dtype=base.dtype) * torch.as_tensor(self.scaling, dtype=base.dtype, device=base.device)
 

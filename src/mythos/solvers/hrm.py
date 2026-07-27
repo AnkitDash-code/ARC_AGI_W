@@ -11,8 +11,10 @@ import sys
 from typing import Any
 
 from mythos.arc import ArcTask
-from mythos.features import hrm_sequence_to_grid, output_shape_hint
+from mythos.features import ARC_MAX_SIZE, hrm_sequence_to_grid, output_shape_hint
 from mythos.hrm_dataset import build_hrm_dataset, default_run_dir, prepare_hrm_raw_dataset
+from mythos.losses import genie_background_consistency_loss
+from mythos.lora import inject_lora_adapters, lora_parameters
 from mythos.solvers.base import SolverError, make_prediction
 from mythos.submission import Prediction
 
@@ -190,7 +192,7 @@ class HRMInferenceRunner:
         pretrain = modules["pretrain"]
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        config = self._load_eval_config(dataset_dir=dataset_dir, output_dir=output_dir)
+        config = _load_hrm_config(self.env.checkpoint_path, dataset_dir=dataset_dir, output_dir=output_dir)
         train_loader, train_metadata = pretrain.create_dataloader(
             config,
             "train",
@@ -219,24 +221,336 @@ class HRMInferenceRunner:
         pretrain.evaluate(config, train_state, eval_loader, eval_metadata, rank=0, world_size=1)
         return _load_decoded_hrm_predictions(output_dir)
 
-    def _load_eval_config(self, *, dataset_dir: Path, output_dir: Path):  # type: ignore[no-untyped-def]
-        try:
-            import yaml
-            from pretrain import PretrainConfig
-        except Exception as exc:  # pragma: no cover - depends on external HRM deps.
-            raise HRMEnvironmentError(f"failed to import HRM config dependencies: {exc}") from exc
 
-        config_path = self.env.checkpoint_path.parent / "all_config.yaml"
-        if not config_path.exists():
-            raise HRMEnvironmentError(f"HRM checkpoint directory is missing all_config.yaml: {config_path}")
-        with config_path.open("r", encoding="utf-8") as handle:
-            config = PretrainConfig(**yaml.safe_load(handle))
-        config.data_path = str(dataset_dir)
-        config.checkpoint_path = str(output_dir)
-        config.eval_save_outputs = ["inputs", "puzzle_identifiers", "logits"]
-        if "HRM_GLOBAL_BATCH_SIZE" in os.environ:
-            config.global_batch_size = int(os.environ["HRM_GLOBAL_BATCH_SIZE"])
-        return config
+@dataclass(frozen=True)
+class TTTConfig:
+    rank: int = 16
+    steps: int = 20
+    lr: float = 1e-3
+    grad_clip_norm: float = 1.0
+    # A step whose (pre-clip) LoRA gradient norm exceeds this is treated as an
+    # explosion: skipped and rolled back rather than clipped-and-applied.
+    explosion_grad_norm: float = 20.0
+    # Must be fixed and consistent across every task's forward passes: the
+    # puzzle embedding's sparse-update buffer (local_weights) is allocated
+    # once at model-init time sized to whatever global_batch_size was used
+    # then, and cannot accept a different batch size later -- confirmed by a
+    # real run: "expand: attempting to expand a dimension of length 4 -> 32"
+    # once the sizing config (32) and a per-task batch (4) diverged. 2 is the
+    # ARC-guaranteed minimum train-pair count for any task, so it's never
+    # dropped as an incomplete batch regardless of augmentation settings.
+    batch_size: int = 2
+    # Weight for the Genie-style background-consistency auxiliary loss (see
+    # mythos.losses.genie_background_consistency_loss): penalizes the model
+    # for changing background cells during TTT, the master plan's named fix
+    # for TTT "hallucinating" -- objects vanishing, backgrounds recoloring --
+    # under pure demo-pair supervision. 0 disables it.
+    genie_weight: float = 0.1
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rank": self.rank,
+            "steps": self.steps,
+            "lr": self.lr,
+            "grad_clip_norm": self.grad_clip_norm,
+            "explosion_grad_norm": self.explosion_grad_norm,
+            "batch_size": self.batch_size,
+            "genie_weight": self.genie_weight,
+        }
+
+
+class HRMTTTRunner:
+    """Per-task test-time training on top of the loaded HRM checkpoint.
+
+    Loads the model once and injects LoRA adapters once (the backbone is
+    frozen at injection time and never receives gradients). For each task:
+    resets the LoRA adapters to their initial no-op state, runs `ttt.steps`
+    gradient-descent steps against only that task's own train pairs, then
+    runs inference with the now-adapted model before moving to the next task.
+
+    The model's puzzle-identifier embedding table is sized once from a
+    dataset build over *all* tasks (matching the batched eval-only path) so
+    it's safely oversized for any single task's tiny per-task dataset build,
+    whose own identifier indices will always fit inside it.
+    """
+
+    def __init__(self, env: HRMEnvironment, ttt: TTTConfig | None = None, num_aug: int = 0) -> None:
+        self.env = env
+        self.ttt = ttt or TTTConfig()
+        self.num_aug = num_aug
+        self._pretrain: Any = None
+        self._train_state: Any = None
+        self._lora_report: Any = None
+        self._lora_init_snapshot: dict[str, Any] = {}
+        self._backbone_verified = False
+
+    def solve_tasks(self, tasks: list[ArcTask] | tuple[ArcTask, ...]) -> list[Prediction]:
+        task_list = list(tasks)
+        if not task_list:
+            return []
+
+        self._ensure_model_loaded(task_list)
+
+        predictions: list[Prediction] = []
+        for task in task_list:
+            predictions.append(self._solve_one_task_with_ttt(task))
+        return predictions
+
+    def _ensure_model_loaded(self, task_list: list[ArcTask]) -> None:
+        if self._train_state is not None:
+            return
+        torch = HRMEnvironment._import_torch()
+        modules = self.env.import_modules()
+        self._pretrain = modules["pretrain"]
+
+        # Dataset build over every task purely to size the model's architecture
+        # (vocab size, puzzle-identifier count) the same way the working
+        # eval-only batched path already does -- not used for training or eval.
+        sizing_run_dir = default_run_dir() / "hrm_ttt_sizing"
+        raw_dir = prepare_hrm_raw_dataset(
+            task_list, sizing_run_dir / "raw" / "ARC-AGI-2" / "data", allow_dummy_test_outputs=True
+        )
+        sizing_dataset_dir = sizing_run_dir / "data" / "arc-2-sizing"
+        build_hrm_dataset(
+            hrm_repo_dir=self.env.repo_dir, raw_data_dir=raw_dir, output_dir=sizing_dataset_dir, num_aug=self.num_aug
+        )
+        sizing_config = _load_hrm_config(
+            self.env.checkpoint_path, dataset_dir=sizing_dataset_dir, output_dir=sizing_run_dir / "outputs"
+        )
+        # Must match what every per-task TTT call below uses (self.ttt.batch_size),
+        # not the eval-only path's larger default -- see TTTConfig.batch_size.
+        sizing_config.global_batch_size = self.ttt.batch_size
+        sizing_loader, sizing_metadata = self._pretrain.create_dataloader(
+            sizing_config, "train", test_set_mode=False, epochs_per_iter=1,
+            global_batch_size=sizing_config.global_batch_size, rank=0, world_size=1,
+        )
+        del sizing_loader
+
+        train_state = self._pretrain.init_train_state(sizing_config, sizing_metadata, world_size=1)
+        checkpoint = torch.load(self.env.checkpoint_path, map_location="cuda", weights_only=False)
+        _load_hrm_checkpoint_best_effort(train_state.model, checkpoint)
+        train_state.step = 0
+
+        report = inject_lora_adapters(
+            train_state.model,
+            rank=self.ttt.rank,
+            # Attention-only adapters cap how much the model's actual per-task
+            # behavior can change; the MLP layers (gate_up_proj/down_proj) are
+            # roughly half the model's parameters and are where most of the
+            # per-token transformation logic lives. Widening the LoRA target
+            # set gives more real capacity to adapt, instead of just pushing
+            # rank/LR higher on a narrower slice of the model (confirmed
+            # unstable: v36's rank=64 attention-only run diverged).
+            target_patterns=("self_attn", "attn", "qkv_proj", "o_proj", "gate_up_proj", "down_proj"),
+            freeze_backbone=True,
+        )
+        print(
+            f"TTT: injected LoRA (rank={self.ttt.rank}) into {len(report.injected_modules)} module(s); "
+            f"{report.trainable_parameters} trainable / {report.frozen_parameters} frozen parameters"
+        )
+        self._lora_report = report
+        self._lora_init_snapshot = {
+            name: parameter.detach().clone()
+            for name, parameter in train_state.model.named_parameters()
+            if "lora_" in name
+        }
+        self._train_state = train_state
+
+    def _reset_lora(self) -> None:
+        torch = HRMEnvironment._import_torch()
+        with torch.no_grad():
+            for name, parameter in self._train_state.model.named_parameters():
+                snapshot = self._lora_init_snapshot.get(name)
+                if snapshot is not None:
+                    parameter.copy_(snapshot)
+
+    def _solve_one_task_with_ttt(self, task: ArcTask) -> Prediction:
+        from mythos.lora import changed_frozen_parameters, snapshot_frozen_parameters
+
+        torch = HRMEnvironment._import_torch()
+        pretrain = self._pretrain
+        train_state = self._train_state
+
+        run_dir = default_run_dir() / "hrm_ttt" / task.id
+        raw_dir = prepare_hrm_raw_dataset(
+            (task,), run_dir / "raw" / "ARC-AGI-2" / "data", allow_dummy_test_outputs=True
+        )
+        dataset_dir = run_dir / "data" / "arc-2-ttt"
+        build_hrm_dataset(
+            hrm_repo_dir=self.env.repo_dir, raw_data_dir=raw_dir, output_dir=dataset_dir, num_aug=self.num_aug
+        )
+        output_dir = run_dir / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config = _load_hrm_config(self.env.checkpoint_path, dataset_dir=dataset_dir, output_dir=output_dir)
+        # Must equal the sizing config's batch size (see TTTConfig.batch_size):
+        # the puzzle embedding's sparse-update buffer is allocated once at
+        # model-init time and cannot accept a different batch size per task.
+        original_batch_size = config.global_batch_size
+        config.global_batch_size = self.ttt.batch_size
+        print(f"TTT: {task.id}: global_batch_size {original_batch_size} -> {config.global_batch_size}")
+
+        train_loader, _train_metadata = pretrain.create_dataloader(
+            config, "train", test_set_mode=False, epochs_per_iter=1,
+            global_batch_size=config.global_batch_size, rank=0, world_size=1,
+        )
+        eval_loader, eval_metadata = pretrain.create_dataloader(
+            config, "test", test_set_mode=True, epochs_per_iter=1,
+            global_batch_size=config.global_batch_size, rank=0, world_size=1,
+        )
+
+        self._reset_lora()
+        lora_params = lora_parameters(train_state.model)
+        optimizer = torch.optim.AdamW(lora_params, lr=self.ttt.lr)
+
+        backbone_snapshot = None
+        if not self._backbone_verified:
+            backbone_snapshot = snapshot_frozen_parameters(train_state.model)
+
+        # Diagnostic: lora_b is zero-initialized (a fresh LoRA adapter is a
+        # mathematical no-op), so any nonzero value after training proves
+        # gradients actually flowed and the optimizer actually updated
+        # something, independent of whether the eval predictions changed.
+        lora_b_before = sum(p.detach().abs().sum().item() for name, p in train_state.model.named_parameters() if name.endswith("lora_b"))
+
+        train_state.model.train()
+        carry = None
+        skipped_steps = 0
+        first_loss = None
+        last_loss = None
+        step_index = 0
+        genie_enabled = self.ttt.genie_weight > 0
+        genie_applied = 0
+        return_keys = ["logits"] if genie_enabled else []
+        for _ in range(self.ttt.steps):
+            for _set_name, batch, global_batch_size in train_loader:
+                batch = {key: (value.to("cuda") if hasattr(value, "to") else value) for key, value in batch.items()}
+                if carry is None:
+                    # initial_carry() creates some internal state tensors (e.g. the
+                    # `halted` flag) without an explicit device argument, relying on
+                    # the ambient default-device context to land them on CUDA --
+                    # confirmed both by HRM's own evaluate() doing the same thing
+                    # and by a real run failing with "Unhandled FakeTensor Device
+                    # Propagation for aten.where.self, found two different devices
+                    # cpu, cuda:0" without this wrapper.
+                    with torch.device("cuda"):
+                        carry = train_state.model.initial_carry(batch)
+                carry, primary_loss, _metrics, preds, _all_finish = train_state.model(
+                    carry=carry, batch=batch, return_keys=return_keys
+                )
+                loss = primary_loss
+                # Only "logits" needs to come from the model's return_keys -- the
+                # input grid is already in hand as batch["inputs"] (what we're
+                # feeding in, not something the model needs to report back).
+                # Requiring all_finish (the model's own halt state) first made
+                # this never fire in a real run: 0/50 steps across every task,
+                # since a single training forward call rarely reaches full ACT
+                # convergence within the step budget. logits are populated on
+                # every call regardless of halt state, so use those directly --
+                # a consistency signal on the model's current best guess is
+                # still useful even before it's fully converged.
+                if genie_enabled:
+                    try:
+                        genie_term = _batch_genie_loss(preds, batch.get("inputs"))
+                        if genie_term is not None:
+                            loss = primary_loss + self.ttt.genie_weight * genie_term
+                            genie_applied += 1
+                    except Exception as exc:  # noqa: BLE001 - auxiliary loss must never abort real TTT
+                        print(f"TTT: {task.id}: disabling Genie loss after a failure: {exc!r}")
+                        genie_enabled = False
+                        return_keys = []
+                loss_value = float(loss.detach())
+                if first_loss is None:
+                    first_loss = loss_value
+                last_loss = loss_value
+                optimizer.zero_grad(set_to_none=True)
+                (loss / max(1, global_batch_size)).backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(lora_params, self.ttt.explosion_grad_norm)
+                if not torch.isfinite(grad_norm) or grad_norm >= self.ttt.explosion_grad_norm:
+                    skipped_steps += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                torch.nn.utils.clip_grad_norm_(lora_params, self.ttt.grad_clip_norm)
+                optimizer.step()
+                step_index += 1
+        if skipped_steps:
+            print(f"TTT: {task.id}: rolled back {skipped_steps}/{self.ttt.steps} step(s) on gradient explosion")
+        if self.ttt.genie_weight > 0:
+            print(f"TTT: {task.id}: Genie consistency loss applied on {genie_applied}/{step_index} step(s)")
+
+        lora_b_after = sum(p.detach().abs().sum().item() for name, p in train_state.model.named_parameters() if name.endswith("lora_b"))
+        print(
+            f"TTT: {task.id}: loss {first_loss!r} -> {last_loss!r} over {step_index} applied step(s); "
+            f"sum(|lora_b|) {lora_b_before:.6f} -> {lora_b_after:.6f}"
+        )
+
+        if backbone_snapshot is not None:
+            changed = changed_frozen_parameters(train_state.model, backbone_snapshot)
+            if changed:
+                print(f"TTT WARNING: {len(changed)} frozen backbone parameter(s) changed during TTT: {changed[:5]}")
+            else:
+                print("TTT: verified frozen backbone parameters are unchanged after a TTT run")
+            self._backbone_verified = True
+
+        train_state.model.eval()
+        pretrain.evaluate(config, train_state, eval_loader, eval_metadata, rank=0, world_size=1)
+        tokens = _load_decoded_hrm_predictions(output_dir)
+        return HRMInferenceRunner(self.env)._tokens_to_prediction(task, tokens)
+
+
+def _load_hrm_config(checkpoint_path: Path, *, dataset_dir: Path, output_dir: Path):  # type: ignore[no-untyped-def]
+    try:
+        import yaml
+        from pretrain import PretrainConfig
+    except Exception as exc:  # pragma: no cover - depends on external HRM deps.
+        raise HRMEnvironmentError(f"failed to import HRM config dependencies: {exc}") from exc
+
+    config_path = checkpoint_path.parent / "all_config.yaml"
+    if not config_path.exists():
+        raise HRMEnvironmentError(f"HRM checkpoint directory is missing all_config.yaml: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = PretrainConfig(**yaml.safe_load(handle))
+    config.data_path = str(dataset_dir)
+    config.checkpoint_path = str(output_dir)
+    config.eval_save_outputs = ["inputs", "puzzle_identifiers", "logits"]
+    if "HRM_GLOBAL_BATCH_SIZE" in os.environ:
+        config.global_batch_size = int(os.environ["HRM_GLOBAL_BATCH_SIZE"])
+    return config
+
+
+def _batch_genie_loss(preds: Any, inputs_batch: Any) -> Any:
+    """Average Genie background-consistency loss across a training batch.
+
+    Decodes each example's own input tokens (from the batch fed to the model,
+    not something the model needs to report back) to a grid -- no need to
+    match against the original un-augmented ArcTask, since the preserve mask
+    is derived from the decoded grid's own dominant color -- and penalizes
+    the model's predicted logits for changing cells that should stay
+    background. Returns None (rather than raising) when preds doesn't
+    contain what's needed, so the caller's own try/except only has to guard
+    against genuine failures.
+    """
+    if not preds or "logits" not in preds or inputs_batch is None:
+        return None
+    logits_batch = preds["logits"]
+    if logits_batch is None or logits_batch.shape[0] == 0:
+        return None
+    # logits comes back as [batch, 900, vocab_size] -- a flat HRM token
+    # sequence, not a [H, W, 10] grid (confirmed by a real run: "logits must
+    # have rank 3 or rank 4"). Reshape to the 30x30 canvas, then slice out
+    # just the 10 color-token channels (HRM's vocab is PAD=0, EOS=1,
+    # colors=2..11 -- see grid_to_hrm_sequence/hrm_sequence_to_grid, the same
+    # scheme already used to decode this model's own predicted output
+    # tokens) since genie_background_consistency_loss compares against plain
+    # 0-9 color indices.
+    per_example_losses = []
+    for example_index in range(logits_batch.shape[0]):
+        input_tokens = inputs_batch[example_index].detach().cpu().tolist()
+        decoded_input = hrm_sequence_to_grid(input_tokens)
+        example_logits = logits_batch[example_index].reshape(ARC_MAX_SIZE, ARC_MAX_SIZE, -1)[:, :, 2:12]
+        per_example_losses.append(genie_background_consistency_loss(example_logits, decoded_input))
+    if not per_example_losses:
+        return None
+    return sum(per_example_losses) / len(per_example_losses)
 
 
 def _load_hrm_checkpoint_best_effort(model: Any, checkpoint: dict[str, Any]) -> None:

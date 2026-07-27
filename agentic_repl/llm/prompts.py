@@ -30,10 +30,34 @@ def build_initial_prompt(task: ArcTask, dsl_catalog: str) -> str:
     )
 
 
-def build_refinement_prompt(previous_code: str, failure_report: str) -> str:
+def build_refinement_prompt(
+    task: ArcTask, dsl_catalog: str, previous_code: str, failure_report: str
+) -> str:
+    """Re-includes the full task (not just the failure text).
+
+    Each LLMClient.generate() call is a fresh, stateless completion, not a
+    multi-turn conversation -- without re-rendering the actual train
+    examples here, the model has no way to see what it got wrong beyond the
+    failure summary, and can't "remember" example dimensions/content from
+    the now-discarded initial-prompt turn. Confirmed as a real bug via a
+    real benchmark run: refinement rounds kept regenerating the same class
+    of error (e.g. wrong output shape) instead of converging.
+    """
+
+    examples = []
+    for index, example in enumerate(task.train):
+        assert example.output is not None
+        examples.append(
+            f"Example {index + 1} input:\n{render_grid(example.input)}\n\n"
+            f"Example {index + 1} output:\n{render_grid(example.output)}\n"
+        )
+    examples_text = "\n".join(examples)
     return (
-        "Your previous solve(grid) candidate did not reproduce every training "
-        "example exactly. Fix it.\n\n"
+        "You are solving an ARC-AGI grid transformation puzzle. Your previous "
+        "solve(grid) candidate did not reproduce every training example exactly. "
+        "Fix it.\n\n"
+        f"{dsl_catalog}\n"
+        f"{examples_text}\n"
         f"Previous code:\n```python\n{previous_code}\n```\n\n"
         f"Failure report:\n{failure_report}\n\n"
         "Respond with ONLY a corrected Python code block defining `solve(grid)`.\n"

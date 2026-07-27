@@ -114,7 +114,9 @@ class AgenticReplSolver:
             attempts_left -= 1
             if attempts_left == 0:
                 return None
-            refinement_prompt = build_refinement_prompt(current, failure or "unknown failure")
+            refinement_prompt = build_refinement_prompt(
+                task, self._dsl_catalog, current, failure or "unknown failure"
+            )
             completions = self._llm_client.generate(refinement_prompt, n=1)
             if not completions:
                 return None

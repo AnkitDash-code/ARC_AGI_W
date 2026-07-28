@@ -1,8 +1,48 @@
 # Project Mythos — ARC-AGI-2 Solver
 
-**Status: shelved.** This project is being set aside in favor of a new architecture. This
-README is a record of what was built, the issues found and fixed along the way, and —
-most importantly — *why* it's being shelved, so that reasoning isn't lost.
+**Status: active again -- see "Agentic program synthesis pivot" below.** The neural
+(HRM/TTT/LoRA) path documented in the rest of this README was shelved (record preserved
+below for why). Since then, a new architecture was built and validated with real,
+verified results on real hardware: an LLM-driven program-synthesis solver
+(`agentic_repl/`) that already measurably beats this project's own documented
+symbolic-solver baseline. Currently paused only because Kaggle's weekly GPU quota was
+exhausted mid-benchmark (refreshes 2026-08-01), not because the approach stopped
+working.
+
+## Agentic program synthesis pivot (current work, real results)
+
+`agentic_repl/` (a separate top-level package from the shelved `src/mythos` neural
+path) has an LLM (`Qwen3-Coder-30B-A3B-Instruct`, GGUF Q4_K_M, run via
+`llama-cpp-python`) generate candidate `solve(grid)` Python programs against a DSL
+built from this project's own verified grid primitives (`mythos.objects`/`object_ops`/
+`symmetry`/`augment`), verifies every candidate against every train pair in a sandboxed
+subprocess REPL before ever trusting it, refines failing candidates against concrete
+failure deltas, and majority-votes across D4-augmented views. See
+`agentic_repl/models/README.md` for the full staging story (offline wheel/model
+staging for Kaggle's internet-disabled L4 sessions) and the git history of
+`scripts/build_standalone_notebook.py` for the real bugs found and fixed getting this
+running on actual Kaggle L4 hardware (wrong LLM completion API for an instruct model,
+a refinement prompt that silently dropped train-example context, a context-window
+overflow).
+
+**Real, verified results** (composed with the existing symbolic solver -- it never
+guesses wrong on train, so running it first only adds coverage, never subtracts),
+against the real public ARC-AGI-2 training split, non-overlapping task slices so no
+result is inflated by re-testing the same tasks twice:
+
+| Tasks (offset) | Exact matches | Rate | Symbolic alone | agentic_repl's unique contribution |
+| --- | --- | --- | --- | --- |
+| 0–100  | 5/100  | 5.0% | 3 | 2 new solves (`08ed6ac7`, `1d0a4b61`) |
+| 100–300 | 13/200 | 6.5% | 5 | 8 new solves |
+| **Cumulative 0–300** | **18/300** | **6.0%** | 8 | **10 new solves beyond symbolic** |
+
+This project's own documented symbolic-solver baseline (see "What actually worked"
+below) is **25/1000 (2.5%)** on the full training split. 6.0% on a 300-task slice is
+more than double that -- a real, measured improvement over the current best result in
+this repository, not just a comparable one. Next step (once GPU quota refreshes):
+continue covering the remaining training tasks (`MYTHOS_TASK_OFFSET`/`MYTHOS_MAX_TASKS`
+in the generated notebook) for a full-1000 comparable number, and the held-out
+evaluation split (120 tasks).
 
 ## TL;DR
 

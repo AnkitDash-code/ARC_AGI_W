@@ -5,7 +5,7 @@
   "min_cell_value": 0,
   "max_cell_value": 9,
   "solvers": {
-    "default": "pipeline",
+    "default": "chain",
     "model_mode": "fallback",
     "hrm": {
       "repo_env": "HRM_REPO_DIR",

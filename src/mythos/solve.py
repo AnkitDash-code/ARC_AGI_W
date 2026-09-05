@@ -15,8 +15,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a Mythos solver.")
     parser.add_argument(
         "--solver",
-        choices=["pipeline", "baseline", "fixture", "symbolic", "hrm", "agentic_repl"],
-        default="pipeline",
+        choices=["pipeline", "baseline", "fixture", "symbolic", "hrm", "agentic_repl", "chain"],
+        default="chain",
     )
     parser.add_argument("--model-mode", choices=["fallback", "strict"], default=None)
     parser.add_argument("--challenges", required=True, help="Path to ARC-style challenges JSON.")

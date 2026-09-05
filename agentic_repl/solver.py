@@ -17,14 +17,21 @@ from mythos.solvers.base import SolverError, make_prediction
 from mythos.submission import Prediction
 
 from agentic_repl.augment_vote import vote_predictions
+from agentic_repl.complexity import program_complexity
 from agentic_repl.dsl.catalog import build_catalog_text
 from agentic_repl.llm.client import LLMClient
-from agentic_repl.llm.prompts import build_initial_prompt, build_refinement_prompt, extract_code_block
+from agentic_repl.llm.prompts import (
+    build_initial_prompt,
+    build_refinement_prompt,
+    build_simplify_prompt,
+    extract_code_block,
+)
 from agentic_repl.repl import ExecutionResult, run_candidate
 
 DEFAULT_NUM_CANDIDATES = 4
 DEFAULT_REFINEMENT_ROUNDS = 2
 DEFAULT_TIMEOUT_SECONDS = 2.0
+DEFAULT_SIMPLIFY_ROUNDS = 1
 
 
 def _debug_enabled() -> bool:
@@ -68,11 +75,13 @@ class AgenticReplSolver:
         num_candidates: int = DEFAULT_NUM_CANDIDATES,
         refinement_rounds: int = DEFAULT_REFINEMENT_ROUNDS,
         timeout_s: float = DEFAULT_TIMEOUT_SECONDS,
+        simplify_rounds: int = DEFAULT_SIMPLIFY_ROUNDS,
     ) -> None:
         self._llm_client = llm_client
         self._num_candidates = num_candidates
         self._refinement_rounds = refinement_rounds
         self._timeout_s = timeout_s
+        self._simplify_rounds = simplify_rounds
         self._dsl_catalog = build_catalog_text()
 
     def solve(self, task: ArcTask) -> Prediction:
@@ -100,8 +109,41 @@ class AgenticReplSolver:
         for code in candidates:
             verified_code = self._refine_until_verified(code, task)
             if verified_code is not None:
-                verified.append(verified_code)
+                verified.append(self._simplify_if_possible(verified_code, task))
         return verified
+
+    def _simplify_if_possible(self, verified_code: str, task: ArcTask) -> str:
+        """Ask for a shorter equivalent of an already-verified candidate and
+        keep whichever version is actually shorter, by AST node count
+        (agentic_repl.complexity.program_complexity) -- an MDL/Occam's-razor
+        safeguard against a candidate that satisfies train pairs by encoding
+        incidental detail rather than the general rule.
+
+        This is a separate, additional bounded step on top of an
+        already-verified candidate -- it does not consume any of the
+        refinement_rounds budget, and per this project's rule that a
+        "simplify" step must never replace a verified candidate with an
+        unverified one, an unverified simplification is always discarded,
+        never surfaced.
+        """
+
+        if self._simplify_rounds <= 0:
+            return verified_code
+        for _ in range(self._simplify_rounds):
+            prompt = build_simplify_prompt(task, self._dsl_catalog, verified_code)
+            completions = self._llm_client.generate(prompt, n=1)
+            if not completions:
+                continue
+            candidate = extract_code_block(completions[0])
+            ok, _ = _verify_on_train(candidate, task, timeout_s=self._timeout_s)
+            if not ok:
+                continue  # discard: never surface an unverified simplification
+            try:
+                if program_complexity(candidate) < program_complexity(verified_code):
+                    verified_code = candidate
+            except SyntaxError:
+                continue  # discard: shouldn't happen for verified code, but never trust blindly
+        return verified_code
 
     def _refine_until_verified(self, code: str, task: ArcTask) -> str | None:
         current = code

@@ -32,7 +32,27 @@ from agentic_repl.solver import AgenticReplSolver  # noqa: E402
 _IDENTITY_CODE = "```python\ndef solve(grid):\n    return grid\n```"
 
 
-def _make_solver(llm_client_name: str, num_candidates: int, refinement_rounds: int, timeout_s: float) -> AgenticReplSolver:
+class _CountingLLMClient:
+    """Wraps an LLMClient and counts generate() calls, so the benchmark can
+    report total LLM calls -- one of the two cost numbers (with wall-clock
+    time) Step 2's simplify-pass cost/benefit measurement needs."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.call_count = 0
+
+    def generate(self, prompt: str, *, n: int, temperature: float = 0.7):
+        self.call_count += 1
+        return self._inner.generate(prompt, n=n, temperature=temperature)
+
+
+def _make_solver(
+    llm_client_name: str,
+    num_candidates: int,
+    refinement_rounds: int,
+    timeout_s: float,
+    simplify_rounds: int,
+) -> tuple[AgenticReplSolver, _CountingLLMClient]:
     if llm_client_name == "stub":
         client = FakeLLMClient(responses=[_IDENTITY_CODE])
     elif llm_client_name == "llamacpp":
@@ -41,9 +61,15 @@ def _make_solver(llm_client_name: str, num_candidates: int, refinement_rounds: i
         client = LlamaCppClient()
     else:
         raise ValueError(f"unknown --llm-client: {llm_client_name}")
-    return AgenticReplSolver(
-        client, num_candidates=num_candidates, refinement_rounds=refinement_rounds, timeout_s=timeout_s
+    counting_client = _CountingLLMClient(client)
+    solver = AgenticReplSolver(
+        counting_client,
+        num_candidates=num_candidates,
+        refinement_rounds=refinement_rounds,
+        simplify_rounds=simplify_rounds,
+        timeout_s=timeout_s,
     )
+    return solver, counting_client
 
 
 def main() -> int:
@@ -55,6 +81,7 @@ def main() -> int:
     parser.add_argument("--candidate-timeout", type=float, default=2.0, help="Per-candidate sandbox exec timeout.")
     parser.add_argument("--num-candidates", type=int, default=4)
     parser.add_argument("--refinement-rounds", type=int, default=2)
+    parser.add_argument("--simplify-rounds", type=int, default=1)
     parser.add_argument("--llm-client", choices=["stub", "llamacpp"], default="stub")
     args = parser.parse_args()
 
@@ -65,7 +92,9 @@ def main() -> int:
     if args.limit:
         task_list = task_list[: args.limit]
 
-    solver = _make_solver(args.llm_client, args.num_candidates, args.refinement_rounds, args.candidate_timeout)
+    solver, counting_client = _make_solver(
+        args.llm_client, args.num_candidates, args.refinement_rounds, args.candidate_timeout, args.simplify_rounds
+    )
 
     fired = 0
     fired_slow: list[str] = []
@@ -111,6 +140,7 @@ def main() -> int:
     print(f"exact_items_of_fired = {exact_items}/{total_items}")
     print(f"total_time_seconds = {total_time:.1f}")
     print(f"avg_seconds_per_task = {total_time / len(task_list):.3f}")
+    print(f"total_llm_calls = {counting_client.call_count}")
     if fired_slow:
         print(f"slow_tasks (>{args.per_task_timeout}s): {len(fired_slow)}")
         for entry in fired_slow[:10]:

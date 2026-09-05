@@ -107,3 +107,79 @@ def test_solver_raises_solver_error_when_nothing_verifies():
 
     with pytest.raises(SolverError):
         solver.solve(task)
+
+
+VERBOSE_IDENTITY_CODE = (
+    "def solve(grid):\n"
+    "    result = []\n"
+    "    for row in grid:\n"
+    "        new_row = []\n"
+    "        for cell in row:\n"
+    "            new_row.append(cell)\n"
+    "        result.append(new_row)\n"
+    "    return result\n"
+)
+WRONG_SHAPE_CODE = "def solve(grid):\n    return [[0]]\n"
+
+
+class _CountingLLMClient:
+    """Wraps a FakeLLMClient and counts generate() calls, for asserting a
+    prompt-building step never fires (e.g. simplify_rounds=0)."""
+
+    def __init__(self, inner: FakeLLMClient) -> None:
+        self._inner = inner
+        self.call_count = 0
+
+    def generate(self, prompt: str, *, n: int, temperature: float = 0.7):
+        self.call_count += 1
+        return self._inner.generate(prompt, n=n, temperature=temperature)
+
+
+def test_simplify_keeps_shorter_verified_candidate():
+    task = _load_task("toy_identity")
+    client = FakeLLMClient(
+        responses=[
+            _fenced(VERBOSE_IDENTITY_CODE),  # verified initial candidate, but verbose
+            _fenced(IDENTITY_CODE),  # shorter, still-correct simplification
+        ]
+    )
+    solver = AgenticReplSolver(
+        client, num_candidates=1, refinement_rounds=0, simplify_rounds=1, timeout_s=2.0
+    )
+
+    verified_codes = solver._search_verified_programs(task)
+
+    assert len(verified_codes) == 1
+    assert verified_codes[0].strip() == IDENTITY_CODE.strip()
+
+
+def test_simplify_discards_broken_simplification():
+    task = _load_task("toy_identity")
+    client = FakeLLMClient(
+        responses=[
+            _fenced(IDENTITY_CODE),  # verified initial candidate
+            _fenced(WRONG_SHAPE_CODE),  # simplification attempt fails verification
+        ]
+    )
+    solver = AgenticReplSolver(
+        client, num_candidates=1, refinement_rounds=0, simplify_rounds=1, timeout_s=2.0
+    )
+
+    verified_codes = solver._search_verified_programs(task)
+
+    assert len(verified_codes) == 1
+    assert verified_codes[0].strip() == IDENTITY_CODE.strip()
+
+
+def test_simplify_rounds_zero_skips_the_pass_entirely():
+    task = _load_task("toy_identity")
+    inner = FakeLLMClient(responses=[_fenced(IDENTITY_CODE), _fenced(WRONG_SHAPE_CODE)])
+    client = _CountingLLMClient(inner)
+    solver = AgenticReplSolver(
+        client, num_candidates=1, refinement_rounds=0, simplify_rounds=0, timeout_s=2.0
+    )
+
+    verified_codes = solver._search_verified_programs(task)
+
+    assert len(verified_codes) == 1
+    assert client.call_count == 1  # only the initial-candidate generate() call, no simplify call

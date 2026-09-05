@@ -109,7 +109,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", choices=sorted(CHALLENGE_FILES), default="test")
     parser.add_argument("--challenges", help="Explicit challenge JSON path; overrides --data-dir/--split.")
     parser.add_argument("--solutions", help="Explicit solutions JSON path for local scoring.")
-    parser.add_argument("--solver", choices=["pipeline", "baseline", "fixture", "hrm"], default="pipeline")
+    parser.add_argument(
+        "--solver",
+        choices=["pipeline", "baseline", "fixture", "hrm", "symbolic", "agentic_repl", "chain"],
+        default="pipeline",
+    )
     parser.add_argument("--model-mode", choices=["fallback", "strict"], default=None)
     parser.add_argument("--out", default=str(DEFAULT_KAGGLE_OUTPUT))
     parser.add_argument("--score", action="store_true", help="Score output when solutions are available.")

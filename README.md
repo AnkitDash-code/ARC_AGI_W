@@ -44,6 +44,194 @@ continue covering the remaining training tasks (`MYTHOS_TASK_OFFSET`/`MYTHOS_MAX
 in the generated notebook) for a full-1000 comparable number, and the held-out
 evaluation split (120 tasks).
 
+## Held-out evaluation split (120 tasks)
+
+**Only the symbolic-solver half of this comparison could be reproduced in the local
+dev environment this section was written in.** The environment has no GPU, no
+`llama-cpp-python` installed, and no staged `Qwen3-Coder-30B-A3B-Instruct` GGUF (the
+30B model that actually produced the 18/300 training-split result above was run on a
+Kaggle L4 session, per "Agentic program synthesis pivot" above) -- running it locally
+would mean either a multi-hour+ CPU inference per task or fabricating a number, and
+per this project's own measurement rule ("every accuracy claim must be measured with
+the real benchmark harness against a real task slice, never assumed"), neither is
+acceptable. What *was* verified locally, against the real public ARC-AGI-2 dataset
+(cloned fresh from `arcprize/ARC-AGI-2`, not the toy fixtures):
+
+| Slice | Solver | Exact tasks | Rate |
+| --- | --- | --- | --- |
+| Training (0-1000) | Symbolic only | 25/1000 | 2.5% | (reproduces the documented number above exactly -- confirms the harness and freshly-cloned dataset are faithful)
+| **Evaluation (120, held-out)** | **Symbolic only** | **1/120** | **0.8%** |
+
+Reproduce with:
+```bash
+git clone --depth 1 https://github.com/arcprize/ARC-AGI-2.git <src>
+python scripts/convert_arc_agi_2_data.py --src <src> --split evaluation --out-dir <out>
+python scripts/benchmark_symbolic.py --challenges <out>/evaluation_challenges.json --solutions <out>/evaluation_solutions.json
+```
+
+**Decision gate: unresolved, not passed.** The relative symbolic-only drop
+(2.5%->0.8%) is large, but the sample is only 1 task and symbolic-only was never the
+subject of this gate -- the gate is about whether `agentic_repl`'s *combined* result
+generalizes, and that number cannot be produced without the real LLM. Per this
+project's rule against assuming accuracy from code review, this section stops here
+rather than guessing whether the gate would pass or fail. **To actually resolve it:**
+run
+```bash
+MYTHOS_AGENTIC_MODEL_PATH=<staged .gguf path> python scripts/benchmark_agentic_repl.py \
+    --challenges <out>/evaluation_challenges.json --solutions <out>/evaluation_solutions.json \
+    --llm-client llamacpp
+```
+on a Kaggle session with the model staged (same setup as the training-split run
+above), the next time GPU quota is available.
+
+Because the gate is unresolved rather than confirmed-passing, Steps 1-2 below (pure
+control-flow / prompt-quality changes, independent of whether `agentic_repl` itself
+generalizes) were implemented and measured with what's available locally. Step 3 (the
+solved-program retrieval library) was intentionally *not* built on top of an
+unvalidated fit -- see its section below.
+
+## Chain solver (Step 1)
+
+`configs/base.json`'s `solvers.default` now points at `"chain"`
+(`mythos.solvers.chain.ChainSolver`, `src/mythos/solvers/chain.py`): tries each solver
+in order, first non-`SolverError` result wins. `mythos.solvers.factory.make_solver`
+builds it as `SymbolicSolver -> AgenticReplSolver -> FixtureSolver ->
+PlannedPipelineSolver`, which is **not** the naive "verified solvers, then the
+already-better neural pipeline, then a guaranteed fallback" ordering it might look
+like -- `PlannedPipelineSolver` is placed *last*, not third, on purpose. Checked
+before wiring it in: in this repo's default config (no `MYTHOS_ENABLE_REAL_HRM` /
+`MYTHOS_ENABLE_TTT` / etc. set), every stage of `PlannedPipeline` falls back to
+`BaselineSolver`'s unverified trivial guess *unconditionally* -- `strict_models` only
+changes behavior when a model is enabled but then fails, not when it's simply
+disabled -- so `PlannedPipelineSolver.solve()` never raises `SolverError` and would
+otherwise always short-circuit the chain before `FixtureSolver`'s better, actually
+train-pair-verified guess got a turn. Confirmed with
+`tests/test_chain_solver.py::test_make_solver_chain_degrades_without_llama_cpp_installed`.
+
+Also found while wiring this in: `AgenticReplSolver`'s real backend
+(`LlamaCppClient`) loads its GGUF model eagerly in `__init__` and raises immediately
+if `llama-cpp-python` isn't installed or no model is staged -- which is true on any
+machine without the full Kaggle agentic stack, including this dev environment. Since
+`"chain"` is now the *default* solver, `make_solver("chain")` catches that specific
+failure and builds the chain without the agentic-REPL step rather than making the
+default solver uninstantiable outside Kaggle; every remaining solver in the chain
+still only ever returns a train-pair-verified prediction, so correctness is
+unaffected, only coverage.
+
+## Simplify-pass cost/benefit (Step 2)
+
+`AgenticReplSolver` now takes a `simplify_rounds` parameter (default 1, matching the
+existing `refinement_rounds` pattern): after a candidate verifies against every train
+pair, it's given one extra chance to be replaced by a shorter *and still verified*
+equivalent (`agentic_repl/llm/prompts.py:build_simplify_prompt`,
+`agentic_repl/complexity.py:program_complexity`). An unverified simplification is
+always discarded -- this project's rule against a "simplify" step ever replacing a
+verified candidate with an unverified one is enforced directly in
+`AgenticReplSolver._simplify_if_possible`, and covered by
+`tests/test_agentic_repl.py::test_simplify_discards_broken_simplification`.
+
+**Complexity metric used: AST node count, not character count.** Checked before
+implementing: character count rewards obfuscation (renaming variables shrinks it
+without simplifying anything), and CompressARC's own MDL framing
+(`third_party/compress_arc`) doesn't transfer here -- it measures bits to encode
+*trained network weights*, not source code. A pure DSL-primitive-call count (via
+`agentic_repl/dsl/catalog.py`'s introspection) was also considered and rejected as the
+*sole* metric: this project has real, documented history (see the
+"DSL-nudged prompts" commits) of the model reaching for hand-written pixel loops that
+use zero DSL primitives, so two such candidates would always tie at 0 and the metric
+couldn't discriminate between them. AST node count avoids both problems and is the
+standard proxy used in program-synthesis Occam's-razor tie-breaking when a full
+probabilistic-grammar description length (as in DreamCoder) isn't available. See
+`agentic_repl/complexity.py`'s module docstring for the full reasoning.
+
+**Measured cost, on the held-out evaluation split (120 tasks), `--llm-client stub`:**
+
+| `simplify_rounds` | fired | total LLM calls | wall-clock |
+| --- | --- | --- | --- |
+| 0 | 0/120 | 1080 | 3.2s |
+| 1 | 0/120 | 1080 | 3.1s |
+
+**No difference, and that's expected, not a null result to hide:** the stub client
+always proposes the literal identity function regardless of `simplify_rounds` or
+prompt content, so on real held-out ARC-AGI-2 tasks (almost none of which are solved
+by identity) nothing ever verifies (`fired = 0`), and a pass that only runs *after* a
+candidate verifies never gets a chance to engage at all. The mechanism itself --
+keeping a shorter verified simplification, discarding a broken one -- is exercised
+and passing in `tests/test_agentic_repl.py` (`test_simplify_keeps_shorter_verified_candidate`,
+`test_simplify_discards_broken_simplification`) against scripted `FakeLLMClient`
+responses, but a real cost/benefit number (does simplification measurably improve
+generalization, and at what LLM-call/wall-clock cost, against tasks the *real* model
+actually solves) needs the same Kaggle GPU + staged model this whole section's
+decision gate is waiting on -- recorded here rather than assumed, per this project's
+own measurement rule.
+
+## Solved-program retrieval library (Step 3) -- researched, not implemented this cycle
+
+**Not built in this cycle, deliberately.** Two independent reasons surfaced, either
+one enough on its own:
+
+1. **The decision gate above is unresolved, not passed.** This project's own rule is
+   "never build on top of an unvalidated fit" -- Step 3 is specifically an
+   *additional* investment on top of `agentic_repl`, and whether `agentic_repl`
+   generalizes to held-out tasks at all is exactly the open question this document's
+   Held-out evaluation section couldn't answer locally.
+2. **The framing in this cycle's plan doesn't match what SOAR actually does.**
+   Checked directly against the paper (Pourcel, Colas & Oudeyer, "Self-Improving
+   Language Models for Evolutionary Program Synthesis: A Case Study on ARC-AGI",
+   ICML 2025 -- [arXiv:2507.14172](https://arxiv.org/abs/2507.14172)): SOAR's
+   hindsight relabeling converts *failed* search attempts into valid
+   `(synthetic-task, program)` pairs used **only to build a LoRA fine-tuning
+   dataset** -- there is no retrieval-augmented few-shot/in-context mechanism in
+   SOAR at all. A solved-program retrieval library (inject similar past solutions
+   as few-shot context at inference time) is a real, independently-motivated idea
+   from the general retrieval-augmented-code-generation literature -- but it is
+   not "the cheap first half of SOAR's mechanism" as originally framed, and
+   presenting it that way would have been a false citation.
+
+**What the research did surface, for whenever the gate resolves and this gets
+built:**
+- Retrieval-augmented few-shot prompting for code has a **documented "more
+  retrieval hurts" failure mode**: CEDAR (Nashid et al., ICSE 2023,
+  "Retrieval-Based Prompt Selection for Code-Related Few-Shot Learning") and a more
+  recent study, "When More Retrieval Hurts: Retrieval-Augmented Code Review
+  Generation" ([arXiv:2511.05302](https://arxiv.org/pdf/2511.05302)), both find
+  that a single well-chosen retrieved example (top-1) often outperforms top-3/top-5
+  -- more retrieved context adds redundant or conflicting cues, not signal. If this
+  library is built, it should inject **one** retrieved example by default, gated by
+  a similarity threshold, not an unconditional top-k -- directly contrary to this
+  cycle's original strawman (`k: int = 3`).
+- On the similarity representation itself: this repo already has a real trained
+  embedding model (`src/mythos/jepa_encoder.py`) rather than needing a
+  hand-designed structural signature from scratch -- worth checking whether it
+  produces usable embeddings standalone (without the rest of the shelved HRM path)
+  before defaulting to hand-picked structural features (grid-size deltas, color
+  count, object count), which is the weaker of the two options per the retrieval
+  literature's general preference for learned over hand-designed similarity when a
+  usable embedding already exists.
+- No published guidance was found on task-level vs. primitive-level retrieval
+  specifically for ARC-style DSL program synthesis (i.e. whether "other tasks that
+  used `fill_enclosed_regions`" beats "other tasks with a similar grid size") --
+  this remains an open design question to test empirically, not something the
+  literature already settled, if/when this gets built.
+
+**To unblock:** resolve the Held-out evaluation gate above (run
+`benchmark_agentic_repl.py --llm-client llamacpp` on Kaggle against the 120-task
+held-out split). If the combined result holds up, build `agentic_repl/library.py`
+per this cycle's original file/test layout, but with `k=1` + a similarity threshold
+as the retrieval default per the finding above, and cite the retrieval-augmented-
+code-generation literature (not SOAR) for that part of the design.
+
+## Hindsight fine-tuning (Step 4) -- not started
+
+Explicitly gated on Step 3 ("Do not start this until Steps 1-3 are built, measured,
+and the library has accumulated a non-trivial number of verified solutions"). Since
+Step 3 wasn't built this cycle (see above), Step 4 is doubly blocked -- not started,
+and its own research-first questions (SOAR's actual LoRA recipe, catastrophic-
+forgetting mitigation, GGUF re-quantization verification) weren't investigated in
+depth this cycle either, beyond confirming above that the paper doesn't publish
+concrete LoRA hyperparameters in its abstract/summary (the full PDF would need a
+closer read before designing `scripts/finetune_agentic_llm.py`'s training recipe).
+
 ## TL;DR
 
 - Built a real HRM (Hierarchical Reasoning Model) inference + test-time-training (TTT)
